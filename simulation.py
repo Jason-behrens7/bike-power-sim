@@ -287,9 +287,9 @@ def solve_speed(
     forces = resistive_forces(
         v, total_mass, cda, crr, rho, grade_rad, headwind_ms
     )
-    p_aero = forces.aero * v / eta
-    p_roll = forces.rolling * v / eta
-    p_grav = forces.gravity * v / eta
+    p_aero = forces.aero * v
+    p_roll = forces.rolling * v
+    p_grav = forces.gravity * v
     p_loss = pw * (1 - eta)
 
     return SimulationResult(
