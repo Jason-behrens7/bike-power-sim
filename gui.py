@@ -310,6 +310,17 @@ class BikeSimApp(tk.Tk):
         )
         scale.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=4)
 
+        # Trace so label updates on programmatic changes (e.g. presets)
+        def _on_trace(*_args: object, vl: ttk.Label = val_label,
+                       vr: tk.DoubleVar = var, r: float = resolution) -> None:
+            v = vr.get()
+            if r >= 1:
+                vl.configure(text=f"{v:.0f}")
+            else:
+                decimals = max(1, len(str(r).split(".")[-1]))
+                vl.configure(text=f"{v:.{decimals}f}")
+        var.trace_add("write", _on_trace)
+
     def _on_scale(
         self,
         value: str,
