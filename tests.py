@@ -12,27 +12,38 @@ from simulation import (
     BikeParams,
     CourseParams,
     CourseSegment,
+    IntervalStep,
+    LeaderboardEntry,
     Preset,
     RiderParams,
     RidingPosition,
     TireType,
+    ZONE_NAMES,
     air_density,
     calculate_cda,
     effective_headwind,
+    estimate_calories,
     estimate_frontal_area,
     export_comparison_csv,
     export_course_csv,
     export_result_csv,
+    export_workout_csv,
     grade_to_radians,
+    load_leaderboard,
     load_presets,
+    parse_gpx,
+    power_zones,
     resistive_forces,
+    save_leaderboard,
     save_presets,
     simulate_course_profile,
+    simulate_workout,
     solve_speed,
     speed_vs_power_curve,
     validate_all,
     validate_param,
     wheel_inertia_factor,
+    zone_for_power,
     # Unit conversions
     kg_to_lbs, lbs_to_kg,
     cm_to_inches, inches_to_cm,
@@ -408,6 +419,173 @@ class TestExportCSV(unittest.TestCase):
         content = Path(path).read_text()
         self.assertIn("Scenario", content)
         Path(path).unlink()
+
+
+# -----------------------------------------------------------------------
+# Phase 3 feature tests
+# -----------------------------------------------------------------------
+
+class TestCalories(unittest.TestCase):
+    def test_positive_calories(self) -> None:
+        cal = estimate_calories(200, 3600)
+        self.assertGreater(cal, 0)
+
+    def test_more_power_more_calories(self) -> None:
+        cal_low = estimate_calories(100, 3600)
+        cal_high = estimate_calories(300, 3600)
+        self.assertGreater(cal_high, cal_low)
+
+    def test_longer_duration_more_calories(self) -> None:
+        cal_short = estimate_calories(200, 1800)
+        cal_long = estimate_calories(200, 3600)
+        self.assertGreater(cal_long, cal_short)
+
+    def test_zero_power_zero_calories(self) -> None:
+        cal = estimate_calories(0, 3600)
+        self.assertAlmostEqual(cal, 0.0)
+
+    def test_reasonable_1hr_200w(self) -> None:
+        cal = estimate_calories(200, 3600)
+        self.assertGreater(cal, 500)
+        self.assertLess(cal, 1000)
+
+
+class TestPowerZones(unittest.TestCase):
+    def test_seven_zones(self) -> None:
+        zones = power_zones(250)
+        self.assertEqual(len(zones), 7)
+
+    def test_zone_names(self) -> None:
+        zones = power_zones(250)
+        names = [z[0] for z in zones]
+        self.assertEqual(names, ZONE_NAMES)
+
+    def test_recovery_zone_low_power(self) -> None:
+        name, _ = zone_for_power(50, 250)
+        self.assertIn("Recovery", name)
+
+    def test_threshold_zone(self) -> None:
+        name, _ = zone_for_power(240, 250)
+        self.assertIn("Threshold", name)
+
+    def test_sprint_zone_high_power(self) -> None:
+        name, _ = zone_for_power(500, 250)
+        self.assertIn("Sprint", name)
+
+
+class TestWorkoutSimulation(unittest.TestCase):
+    def test_single_step(self) -> None:
+        steps = [IntervalStep(power_watts=200, duration_s=300)]
+        rider = RiderParams(power_watts=200)
+        bike = BikeParams()
+        course = CourseParams()
+        result = simulate_workout(steps, rider, bike, course, time_resolution_s=10)
+        self.assertGreater(result.total_distance_m, 0)
+        self.assertAlmostEqual(result.total_time_s, 300, delta=1)
+        self.assertGreater(result.total_calories_kcal, 0)
+
+    def test_multi_step(self) -> None:
+        steps = [
+            IntervalStep(power_watts=150, duration_s=120),
+            IntervalStep(power_watts=300, duration_s=60),
+        ]
+        rider = RiderParams(power_watts=200)
+        bike = BikeParams()
+        course = CourseParams()
+        result = simulate_workout(steps, rider, bike, course, time_resolution_s=10)
+        self.assertAlmostEqual(result.total_time_s, 180, delta=1)
+        self.assertEqual(len(result.points), 18)
+
+    def test_avg_power(self) -> None:
+        steps = [IntervalStep(power_watts=200, duration_s=100)]
+        rider = RiderParams(power_watts=200)
+        bike = BikeParams()
+        course = CourseParams()
+        result = simulate_workout(steps, rider, bike, course, time_resolution_s=10)
+        self.assertAlmostEqual(result.avg_power_watts, 200, delta=1)
+
+    def test_work_calculation(self) -> None:
+        steps = [IntervalStep(power_watts=200, duration_s=100)]
+        rider = RiderParams(power_watts=200)
+        bike = BikeParams()
+        course = CourseParams()
+        result = simulate_workout(steps, rider, bike, course, time_resolution_s=10)
+        self.assertAlmostEqual(result.total_work_kj, 20.0, delta=0.5)
+
+
+class TestExportWorkoutCSV(unittest.TestCase):
+    def test_export(self) -> None:
+        steps = [IntervalStep(power_watts=200, duration_s=60)]
+        rider = RiderParams(power_watts=200)
+        bike = BikeParams()
+        course = CourseParams()
+        result = simulate_workout(steps, rider, bike, course, time_resolution_s=10)
+        with tempfile.NamedTemporaryFile(suffix=".csv", delete=False) as f:
+            path = f.name
+        export_workout_csv(result, path)
+        content = Path(path).read_text()
+        self.assertIn("Power (W)", content)
+        self.assertIn("Calories", content)
+        Path(path).unlink()
+
+
+class TestGPXParsing(unittest.TestCase):
+    def test_parse_simple_gpx(self) -> None:
+        gpx_content = """<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" xmlns="http://www.topografix.com/GPX/1/1">
+  <trk><trkseg>
+    <trkpt lat="47.0" lon="8.0"><ele>500</ele></trkpt>
+    <trkpt lat="47.002" lon="8.0"><ele>510</ele></trkpt>
+    <trkpt lat="47.004" lon="8.0"><ele>505</ele></trkpt>
+  </trkseg></trk>
+</gpx>"""
+        with tempfile.NamedTemporaryFile(suffix=".gpx", delete=False, mode="w") as f:
+            f.write(gpx_content)
+            path = f.name
+        segments = parse_gpx(path)
+        self.assertGreater(len(segments), 0)
+        for seg in segments:
+            self.assertGreater(seg.distance_m, 0)
+        Path(path).unlink()
+
+    def test_empty_gpx(self) -> None:
+        gpx_content = """<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" xmlns="http://www.topografix.com/GPX/1/1">
+  <trk><trkseg></trkseg></trk>
+</gpx>"""
+        with tempfile.NamedTemporaryFile(suffix=".gpx", delete=False, mode="w") as f:
+            f.write(gpx_content)
+            path = f.name
+        segments = parse_gpx(path)
+        self.assertEqual(len(segments), 0)
+        Path(path).unlink()
+
+
+class TestLeaderboard(unittest.TestCase):
+    def test_save_load_roundtrip(self) -> None:
+        entries = [
+            LeaderboardEntry(
+                course_name="Test Course",
+                rider_name="Alice",
+                time_s=1200,
+                avg_speed_kmh=30.0,
+                power_watts=250,
+                date="2025-01-15",
+            )
+        ]
+        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
+            path = f.name
+        save_leaderboard(entries, path)
+        loaded = load_leaderboard(path)
+        self.assertEqual(len(loaded), 1)
+        self.assertEqual(loaded[0].course_name, "Test Course")
+        self.assertEqual(loaded[0].rider_name, "Alice")
+        self.assertAlmostEqual(loaded[0].time_s, 1200)
+        Path(path).unlink()
+
+    def test_load_nonexistent_returns_empty(self) -> None:
+        loaded = load_leaderboard("/tmp/nonexistent_leaderboard_xyz.json")
+        self.assertEqual(loaded, [])
 
 
 if __name__ == "__main__":

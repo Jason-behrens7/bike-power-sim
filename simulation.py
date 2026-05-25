@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass, field, asdict
+import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import NamedTuple
@@ -27,6 +28,8 @@ MOLAR_MASS_AIR = 0.0289644  # kg/mol
 SEA_LEVEL_AIR_DENSITY = 1.225  # kg/m³
 DEFAULT_WHEEL_MASS = 1.8  # kg per wheel
 DEFAULT_WHEEL_RADIUS = 0.34  # m (700c)
+METABOLIC_EFFICIENCY = 0.25  # ~25% of metabolic energy becomes pedal power
+KJ_TO_KCAL = 0.239006
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +101,7 @@ class CourseParams:
     """Course / environmental parameters."""
     grade_pct: float = 0.0
     headwind_kmh: float = 0.0
-    wind_direction_deg: float = 0.0  # 0=head, 90=cross, 180=tail
+    wind_direction_deg: float = 0.0
     elevation_m: float = 0.0
     temperature_c: float = 20.0
 
@@ -167,6 +170,81 @@ class Preset:
     rider: RiderParams
     bike: BikeParams
     course: CourseParams
+
+
+# ---------------------------------------------------------------------------
+# Interval / workout
+# ---------------------------------------------------------------------------
+@dataclass
+class IntervalStep:
+    """One step in an interval workout."""
+    power_watts: float = 200.0
+    duration_s: float = 300.0
+
+
+@dataclass
+class IntervalPoint:
+    """A single time-point result from an interval simulation."""
+    time_s: float
+    power_watts: float
+    speed_kmh: float
+    distance_m: float
+    calories_kcal: float
+
+
+@dataclass
+class WorkoutResult:
+    """Full result of an interval workout simulation."""
+    points: list[IntervalPoint]
+    total_time_s: float
+    total_distance_m: float
+    total_calories_kcal: float
+    total_work_kj: float
+    avg_speed_kmh: float
+    avg_power_watts: float
+
+
+# ---------------------------------------------------------------------------
+# Leaderboard
+# ---------------------------------------------------------------------------
+@dataclass
+class LeaderboardEntry:
+    """A single leaderboard entry."""
+    course_name: str
+    rider_name: str
+    time_s: float
+    avg_speed_kmh: float
+    power_watts: float
+    date: str
+
+
+# ---------------------------------------------------------------------------
+# Power zones
+# ---------------------------------------------------------------------------
+ZONE_NAMES = ["Z1 Recovery", "Z2 Endurance", "Z3 Tempo",
+              "Z4 Threshold", "Z5 VO2max", "Z6 Anaerobic", "Z7 Sprint"]
+ZONE_COLORS = ["#89b4fa", "#a6e3a1", "#f9e2af", "#fab387",
+               "#f38ba8", "#cba6f7", "#f5c2e7"]
+
+
+def power_zones(ftp: float) -> list[tuple[str, float, float, str]]:
+    """Return power zones as (name, low_watts, high_watts, color) based on FTP."""
+    boundaries = [0, 0.55, 0.75, 0.90, 1.05, 1.20, 1.50, 999.0]
+    zones = []
+    for i, name in enumerate(ZONE_NAMES):
+        lo = ftp * boundaries[i]
+        hi = ftp * boundaries[i + 1]
+        zones.append((name, lo, hi, ZONE_COLORS[i]))
+    return zones
+
+
+def zone_for_power(power: float, ftp: float) -> tuple[str, str]:
+    """Return (zone_name, zone_color) for a given power and FTP."""
+    zones = power_zones(ftp)
+    for name, lo, hi, color in zones:
+        if lo <= power < hi:
+            return name, color
+    return ZONE_NAMES[-1], ZONE_COLORS[-1]
 
 
 # ---------------------------------------------------------------------------
@@ -299,25 +377,26 @@ def grade_to_radians(grade_pct: float) -> float:
 
 
 def effective_headwind(wind_speed_kmh: float, wind_direction_deg: float) -> float:
-    """Calculate effective headwind component from wind speed and direction.
-
-    wind_direction_deg: 0 = pure headwind, 90 = crosswind, 180 = tailwind.
-    Returns effective headwind in km/h (positive = opposing).
-    """
+    """Calculate effective headwind component from wind speed and direction."""
     rad = math.radians(wind_direction_deg)
     return wind_speed_kmh * math.cos(rad)
 
 
 def wheel_inertia_factor(wheel_mass_kg: float, wheel_radius_m: float,
                           total_mass_kg: float) -> float:
-    """Calculate effective mass multiplier accounting for wheel rotational inertia.
-
-    Two wheels modeled as hoops (I = m*r²). The factor is applied to the
-    total mass for acceleration calculations. For steady-state it's ~1.0,
-    but it affects the power balance at the margin.
-    """
+    """Calculate effective mass multiplier accounting for wheel rotational inertia."""
     i_wheels = 2 * wheel_mass_kg * wheel_radius_m ** 2
     return 1.0 + i_wheels / (total_mass_kg * wheel_radius_m ** 2)
+
+
+def estimate_calories(power_watts: float, duration_s: float) -> float:
+    """Estimate calories burned from power output and duration.
+
+    Assumes ~25% gross metabolic efficiency (75% lost as heat).
+    """
+    work_kj = power_watts * duration_s / 1000.0
+    metabolic_kj = work_kj / METABOLIC_EFFICIENCY
+    return metabolic_kj * KJ_TO_KCAL
 
 
 # ---------------------------------------------------------------------------
@@ -369,11 +448,7 @@ def solve_speed(
     max_iter: int = 100,
     tol: float = 1e-6,
 ) -> SimulationResult:
-    """Solve for steady-state speed given power and conditions.
-
-    Uses Newton-Raphson iteration to find the speed where power input
-    equals power required to overcome all resistive forces.
-    """
+    """Solve for steady-state speed given power and conditions."""
     pw = power_override if power_override is not None else rider.power_watts
     total_mass = rider.weight_kg + bike.weight_kg
     inertia_factor = wheel_inertia_factor(
@@ -540,6 +615,158 @@ def simulate_course_profile(
 
 
 # ---------------------------------------------------------------------------
+# Interval / workout simulation
+# ---------------------------------------------------------------------------
+
+def simulate_workout(
+    steps: list[IntervalStep],
+    rider: RiderParams,
+    bike: BikeParams,
+    course: CourseParams,
+    time_resolution_s: float = 1.0,
+) -> WorkoutResult:
+    """Simulate an interval workout and return time-series results."""
+    points: list[IntervalPoint] = []
+    cumulative_time = 0.0
+    cumulative_dist = 0.0
+    cumulative_cal = 0.0
+    total_work_kj = 0.0
+    total_power_time = 0.0
+
+    for step in steps:
+        t = 0.0
+        while t < step.duration_s:
+            dt = min(time_resolution_s, step.duration_s - t)
+            result = solve_speed(rider, bike, course,
+                                 power_override=step.power_watts)
+            dist = result.speed_ms * dt
+            cal = estimate_calories(step.power_watts, dt)
+
+            cumulative_time += dt
+            cumulative_dist += dist
+            cumulative_cal += cal
+            total_work_kj += step.power_watts * dt / 1000.0
+            total_power_time += step.power_watts * dt
+
+            points.append(IntervalPoint(
+                time_s=cumulative_time,
+                power_watts=step.power_watts,
+                speed_kmh=result.speed_kmh,
+                distance_m=cumulative_dist,
+                calories_kcal=cumulative_cal,
+            ))
+            t += dt
+
+    avg_speed = (cumulative_dist / cumulative_time * 3.6) if cumulative_time > 0 else 0.0
+    avg_power = (total_power_time / cumulative_time) if cumulative_time > 0 else 0.0
+
+    return WorkoutResult(
+        points=points,
+        total_time_s=cumulative_time,
+        total_distance_m=cumulative_dist,
+        total_calories_kcal=cumulative_cal,
+        total_work_kj=total_work_kj,
+        avg_speed_kmh=avg_speed,
+        avg_power_watts=avg_power,
+    )
+
+
+# ---------------------------------------------------------------------------
+# GPX parsing
+# ---------------------------------------------------------------------------
+
+def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """Distance in meters between two lat/lon points."""
+    R = 6371000.0
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlam = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlam / 2) ** 2
+    return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+
+def parse_gpx(filepath: str | Path) -> list[CourseSegment]:
+    """Parse a GPX file and return a list of CourseSegments.
+
+    Groups consecutive trackpoints into segments with averaged grade.
+    Uses ~200m minimum segment length to avoid noise.
+    """
+    tree = ET.parse(filepath)
+    root = tree.getroot()
+
+    ns = ""
+    if root.tag.startswith("{"):
+        ns = root.tag.split("}")[0] + "}"
+
+    trackpoints: list[tuple[float, float, float]] = []
+    for trkpt in root.iter(f"{ns}trkpt"):
+        lat = float(trkpt.attrib["lat"])
+        lon = float(trkpt.attrib["lon"])
+        ele_elem = trkpt.find(f"{ns}ele")
+        ele = float(ele_elem.text) if ele_elem is not None else 0.0
+        trackpoints.append((lat, lon, ele))
+
+    if len(trackpoints) < 2:
+        return []
+
+    min_seg_len = 200.0
+    segments: list[CourseSegment] = []
+    seg_start = 0
+
+    for i in range(1, len(trackpoints)):
+        dist_so_far = 0.0
+        for j in range(seg_start, i):
+            dist_so_far += _haversine(
+                trackpoints[j][0], trackpoints[j][1],
+                trackpoints[j + 1][0], trackpoints[j + 1][1]
+            )
+
+        if dist_so_far >= min_seg_len or i == len(trackpoints) - 1:
+            if dist_so_far > 0:
+                elev_change = trackpoints[i][2] - trackpoints[seg_start][2]
+                grade = (elev_change / dist_so_far) * 100.0
+                avg_elev = (trackpoints[seg_start][2] + trackpoints[i][2]) / 2.0
+                segments.append(CourseSegment(
+                    distance_m=dist_so_far,
+                    grade_pct=grade,
+                    elevation_m=avg_elev,
+                    temperature_c=20.0,
+                ))
+            seg_start = i
+
+    return segments
+
+
+# ---------------------------------------------------------------------------
+# Leaderboard
+# ---------------------------------------------------------------------------
+
+def save_leaderboard(entries: list[LeaderboardEntry], filepath: str | Path) -> None:
+    """Save leaderboard entries to JSON."""
+    data = [
+        {
+            "course_name": e.course_name,
+            "rider_name": e.rider_name,
+            "time_s": e.time_s,
+            "avg_speed_kmh": e.avg_speed_kmh,
+            "power_watts": e.power_watts,
+            "date": e.date,
+        }
+        for e in entries
+    ]
+    Path(filepath).write_text(json.dumps(data, indent=2))
+
+
+def load_leaderboard(filepath: str | Path) -> list[LeaderboardEntry]:
+    """Load leaderboard entries from JSON."""
+    path = Path(filepath)
+    if not path.exists():
+        return []
+    data = json.loads(path.read_text())
+    return [LeaderboardEntry(**d) for d in data]
+
+
+# ---------------------------------------------------------------------------
 # Preset save/load
 # ---------------------------------------------------------------------------
 
@@ -680,6 +907,29 @@ def export_comparison_csv(
             f"{result.speed_kmh:.2f},{result.speed_mph:.2f},"
             f"{result.power_aero:.1f},{result.power_rolling:.1f},{result.power_gravity:.1f}"
         )
+    Path(filepath).write_text("\n".join(lines))
+
+
+def export_workout_csv(
+    workout: WorkoutResult,
+    filepath: str | Path,
+) -> None:
+    """Export workout results to CSV."""
+    lines = [
+        "Time (s),Power (W),Speed (km/h),Distance (m),Calories (kcal)"
+    ]
+    for pt in workout.points:
+        lines.append(
+            f"{pt.time_s:.1f},{pt.power_watts:.0f},{pt.speed_kmh:.2f},"
+            f"{pt.distance_m:.1f},{pt.calories_kcal:.1f}"
+        )
+    lines.append("")
+    lines.append(f"Total Time (s),{workout.total_time_s:.1f}")
+    lines.append(f"Total Distance (m),{workout.total_distance_m:.0f}")
+    lines.append(f"Avg Speed (km/h),{workout.avg_speed_kmh:.2f}")
+    lines.append(f"Avg Power (W),{workout.avg_power_watts:.0f}")
+    lines.append(f"Total Work (kJ),{workout.total_work_kj:.1f}")
+    lines.append(f"Total Calories (kcal),{workout.total_calories_kcal:.0f}")
     Path(filepath).write_text("\n".join(lines))
 
 

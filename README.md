@@ -14,33 +14,48 @@ A physics-based cycling power simulation with a graphical user interface. Calcul
   - Air density variation with elevation and temperature
   - Wind direction modeling (headwind, crosswind, tailwind)
   - Wheel rotational inertia
+  - Calorie & energy expenditure estimation
 
-- **Interactive Tabbed GUI**:
-  - **Simulation tab**: Real-time speed calculation with sliders for all parameters
-  - **Course Profile tab**: Define multi-segment routes with varying grades and see speed over distance
-  - **Compare tab**: Build and compare multiple scenarios side-by-side with bar chart
-  - **Export tab**: Export results, course profiles, and comparisons to CSV
+- **Interactive Tabbed GUI** (6 tabs):
+  - **Simulation**: Real-time speed calculation with sliders, power zone display, calorie estimates
+  - **Course Profile**: Multi-segment routes with GPX import, speed/elevation charts, animated ride playback
+  - **Workout**: Interval/workout simulator with zone-colored power profiles
+  - **Compare**: Side-by-side scenario comparison with bar charts
+  - **Leaderboard**: Personal records on saved courses
+  - **Export**: CSV and PDF report generation
+
+- **Dark/Light Theme Toggle**: Switch between Catppuccin dark and light color schemes
+
+- **GPX Import**: Load real-world routes from GPX files and simulate speed on them
+
+- **Power Zone Visualization**: Z1-Z7 colored bands on speed-vs-power chart and workout profiles (based on FTP)
+
+- **Interval/Workout Simulator**: Define power intervals (e.g., 5min @ 300W, 2min @ 150W) and see speed, distance, and calories over time
+
+- **Animated Ride Playback**: Watch a dot traverse the course elevation profile in real time
+
+- **Leaderboard**: Save course results with rider/course names, track best times
+
+- **Drag & Drop Segment Reordering**: Move segments up/down in the course profile
+
+- **PDF Report Generation**: Multi-page PDF with simulation parameters, speed-vs-power curve, power breakdown pie chart, and course profile charts
+
+- **Calorie Estimation**: Estimates kcal burned based on power output and metabolic efficiency (~25%)
 
 - **Input Validation**: Real-time feedback for out-of-range parameter values
 
 - **Unit Toggle**: Switch between metric (km/h, kg, m) and imperial (mph, lbs, ft)
 
-- **Presets**: Quick-load common scenarios (flat road, climbing, time trial, etc.)
-  - Save/load custom presets to JSON files
+- **Presets**: Quick-load common scenarios; save/load custom presets to JSON files
 
-- **Course Profile Simulation**: Define multi-segment courses and simulate speed, time, and elevation across the entire route
-
-- **Scenario Comparison**: Add multiple configurations side-by-side and compare results visually
-
-- **CSV Export**: Export single results, course profiles, or scenario comparisons
+- **CSV Export**: Export results, course profiles, workouts, and scenario comparisons
 
 ## Installation
 
 ### Requirements
 - Python 3.10+
 - tkinter (usually included with Python; on macOS with Homebrew, install `python-tk`)
-- matplotlib
-- numpy
+- matplotlib, numpy, gpxpy
 
 ### Setup
 
@@ -63,11 +78,14 @@ python main.py
 ## Usage
 
 1. Launch the app with `python main.py`
-2. **Simulation tab**: Adjust rider, bike, and course parameters using sliders; view real-time speed, power curve, and breakdown chart
-3. **Course Profile tab**: Add segments with different grades/conditions, click "Run Profile" to see speed and elevation plots
-4. **Compare tab**: Click "Add Current as Scenario" to snapshot the current settings, repeat with different configurations to compare
-5. **Export tab**: Export results to CSV files
-6. Use **Presets** to quickly load common riding scenarios, or save your own
+2. **Simulation tab**: Adjust rider, bike, and course parameters using sliders; view real-time speed, power zone, calorie rate, power curve with zone bands, and breakdown chart
+3. **Course Profile tab**: Add segments, import GPX files, click "Run Profile" to see speed and elevation plots, use "Animate" for ride playback. Reorder segments with Move Up/Down buttons
+4. **Workout tab**: Define interval steps (power + duration), click "Run Workout" to see zone-colored power profile and speed chart with calorie/work summary
+5. **Compare tab**: Click "Add Current as Scenario" to snapshot settings, compare multiple scenarios visually
+6. **Leaderboard tab**: Save course results, track personal records
+7. **Export tab**: Export results to CSV or generate a multi-page PDF report
+8. Use the **Light Mode / Dark Mode** button to toggle themes
+9. Use **Presets** to quickly load common riding scenarios, or save your own
 
 ## Physics Model
 
@@ -84,6 +102,8 @@ Where:
   m_eff     = m × (1 + I_wheels / (m × r²))       — effective mass with wheel inertia
   η         = drivetrain efficiency (default 97%)
   ρ         = air density (adjusted for elevation & temperature)
+
+Calories: work_kJ / metabolic_efficiency × 0.239 kcal/kJ
 ```
 
 Speed is found iteratively using Newton's method to solve this nonlinear equation.
@@ -93,6 +113,8 @@ Speed is found iteratively using Newton's method to solve this nonlinear equatio
 ```bash
 python -m unittest tests -v
 ```
+
+75 unit tests covering physics, validation, unit conversions, wind direction, wheel inertia, course profiles, workout simulation, power zones, GPX parsing, leaderboard, preset save/load, and CSV/workout export.
 
 ## License
 
