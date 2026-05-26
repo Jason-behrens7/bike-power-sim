@@ -12,8 +12,8 @@ from simulation import (
     BikeParams,
     CourseParams,
     CourseSegment,
+    CriticalPowerModel,
     IntervalStep,
-    LeaderboardEntry,
     Preset,
     RaceCompetitor,
     RIDER_CATEGORIES,
@@ -26,20 +26,21 @@ from simulation import (
     classify_rider,
     effective_headwind,
     estimate_calories,
+    estimate_cp_from_ftp,
     estimate_frontal_area,
     export_comparison_csv,
     export_course_csv,
     export_result_csv,
     export_workout_csv,
+    fit_cp_model,
     grade_to_radians,
-    load_leaderboard,
     load_presets,
+    optimize_pacing,
     parse_gpx,
     parse_gpx_with_coords,
     power_to_weight_ratio,
     power_zones,
     resistive_forces,
-    save_leaderboard,
     save_presets,
     simulate_course_profile,
     simulate_race,
@@ -568,33 +569,6 @@ class TestGPXParsing(unittest.TestCase):
         Path(path).unlink()
 
 
-class TestLeaderboard(unittest.TestCase):
-    def test_save_load_roundtrip(self) -> None:
-        entries = [
-            LeaderboardEntry(
-                course_name="Test Course",
-                rider_name="Alice",
-                time_s=1200,
-                avg_speed_kmh=30.0,
-                power_watts=250,
-                date="2025-01-15",
-            )
-        ]
-        with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
-            path = f.name
-        save_leaderboard(entries, path)
-        loaded = load_leaderboard(path)
-        self.assertEqual(len(loaded), 1)
-        self.assertEqual(loaded[0].course_name, "Test Course")
-        self.assertEqual(loaded[0].rider_name, "Alice")
-        self.assertAlmostEqual(loaded[0].time_s, 1200)
-        Path(path).unlink()
-
-    def test_load_nonexistent_returns_empty(self) -> None:
-        loaded = load_leaderboard("/tmp/nonexistent_leaderboard_xyz.json")
-        self.assertEqual(loaded, [])
-
-
 # -----------------------------------------------------------------------
 # Phase 4 feature tests
 # -----------------------------------------------------------------------
@@ -775,6 +749,110 @@ class TestGPXWithCoords(unittest.TestCase):
         points = parse_gpx_with_coords(path)
         self.assertGreater(points[1]["grade_pct"], 0)
         Path(path).unlink()
+
+
+class TestCriticalPowerModel(unittest.TestCase):
+    def test_estimate_from_ftp(self) -> None:
+        model = estimate_cp_from_ftp(250)
+        self.assertAlmostEqual(model.cp_watts, 240.0)
+        self.assertAlmostEqual(model.w_prime_joules, 20000.0)
+
+    def test_max_power_decreases_with_duration(self) -> None:
+        model = CriticalPowerModel(cp_watts=240, w_prime_joules=20000)
+        p5min = model.max_power_for_duration(300)
+        p20min = model.max_power_for_duration(1200)
+        self.assertGreater(p5min, p20min)
+
+    def test_tte_above_cp(self) -> None:
+        model = CriticalPowerModel(cp_watts=240, w_prime_joules=20000)
+        tte = model.time_to_exhaustion(340)
+        self.assertAlmostEqual(tte, 200.0)
+
+    def test_tte_at_cp_is_infinite(self) -> None:
+        model = CriticalPowerModel(cp_watts=240, w_prime_joules=20000)
+        tte = model.time_to_exhaustion(240)
+        self.assertEqual(tte, float("inf"))
+
+    def test_tte_below_cp_is_infinite(self) -> None:
+        model = CriticalPowerModel(cp_watts=240, w_prime_joules=20000)
+        tte = model.time_to_exhaustion(200)
+        self.assertEqual(tte, float("inf"))
+
+    def test_w_prime_balance(self) -> None:
+        model = CriticalPowerModel(cp_watts=240, w_prime_joules=20000)
+        bal = model.w_prime_balance(340, 100)
+        self.assertAlmostEqual(bal, 10000.0)
+
+    def test_w_prime_balance_below_cp(self) -> None:
+        model = CriticalPowerModel(cp_watts=240, w_prime_joules=20000)
+        bal = model.w_prime_balance(200, 100)
+        self.assertAlmostEqual(bal, 20000.0)
+
+    def test_power_curve_shape(self) -> None:
+        model = CriticalPowerModel(cp_watts=240, w_prime_joules=20000)
+        durations, powers = model.power_curve()
+        self.assertEqual(len(durations), len(powers))
+        self.assertGreater(len(durations), 5)
+        for i in range(1, len(powers)):
+            self.assertLessEqual(powers[i], powers[i-1])
+
+    def test_fit_cp_model(self) -> None:
+        model = fit_cp_model(350, 300, 280, 1200)
+        self.assertGreater(model.cp_watts, 200)
+        self.assertGreater(model.w_prime_joules, 1000)
+
+
+class TestPacingOptimization(unittest.TestCase):
+    def test_basic_pacing(self) -> None:
+        rider = RiderParams(power_watts=250, weight_kg=75)
+        bike = BikeParams()
+        segs = [
+            CourseSegment(distance_m=5000, grade_pct=0),
+            CourseSegment(distance_m=2000, grade_pct=5),
+        ]
+        result = optimize_pacing(rider, bike, segs, ftp=250)
+        self.assertGreater(result.total_time_s, 0)
+        self.assertEqual(len(result.segments), 2)
+
+    def test_time_saved_positive(self) -> None:
+        rider = RiderParams(power_watts=250, weight_kg=75)
+        bike = BikeParams()
+        segs = [
+            CourseSegment(distance_m=5000, grade_pct=0),
+            CourseSegment(distance_m=2000, grade_pct=6),
+            CourseSegment(distance_m=3000, grade_pct=-4),
+        ]
+        result = optimize_pacing(rider, bike, segs, ftp=250)
+        self.assertGreater(result.time_saved_s, 0)
+
+    def test_climb_gets_more_power(self) -> None:
+        rider = RiderParams(power_watts=250, weight_kg=75)
+        bike = BikeParams()
+        segs = [
+            CourseSegment(distance_m=5000, grade_pct=0),
+            CourseSegment(distance_m=2000, grade_pct=8),
+            CourseSegment(distance_m=3000, grade_pct=-5),
+        ]
+        result = optimize_pacing(rider, bike, segs, ftp=250)
+        flat_power = result.segments[0].optimal_power
+        climb_power = result.segments[1].optimal_power
+        descent_power = result.segments[2].optimal_power
+        self.assertGreater(climb_power, flat_power)
+        self.assertGreater(flat_power, descent_power)
+
+    def test_pacing_strategy_notes(self) -> None:
+        rider = RiderParams(power_watts=250, weight_kg=75)
+        bike = BikeParams()
+        segs = [CourseSegment(distance_m=5000, grade_pct=6)]
+        result = optimize_pacing(rider, bike, segs, ftp=250)
+        self.assertIn("climb", result.segments[0].strategy_note.lower())
+
+    def test_avg_speed_positive(self) -> None:
+        rider = RiderParams(power_watts=250, weight_kg=75)
+        bike = BikeParams()
+        segs = [CourseSegment(distance_m=5000, grade_pct=0)]
+        result = optimize_pacing(rider, bike, segs, ftp=250)
+        self.assertGreater(result.avg_speed_kmh, 0)
 
 
 if __name__ == "__main__":

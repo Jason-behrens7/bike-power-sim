@@ -16,15 +16,16 @@ A physics-based cycling power simulation with a graphical user interface. Calcul
   - Wheel rotational inertia
   - Calorie & energy expenditure estimation
 
-- **Interactive Tabbed GUI** (9 tabs):
+- **Interactive Tabbed GUI** (10 tabs):
   - **Simulation**: Real-time speed calculation with sliders, power zone display, calorie estimates, W/kg display
   - **Course Profile**: Multi-segment routes with GPX import, speed/elevation charts, animated ride playback
   - **Workout**: Interval/workout simulator with zone-colored power profiles
   - **Compare**: Side-by-side scenario comparison with bar charts
-  - **Leaderboard**: Personal records on saved courses
   - **W/kg Analysis**: Power-to-weight ratio with rider classification (Cat 5 to World Tour Pro)
   - **Race**: Virtual race simulation with multiple competitors and gap analysis
-  - **3D / Map**: 3D course visualization and gradient-colored route map from GPX
+  - **3D / Map**: 3D course visualization, elevation heatmap overlay, and gradient-colored route map from GPX
+  - **CP / W'**: Critical power model with power-duration curves and time-to-exhaustion analysis
+  - **Pacing**: Route optimization with optimal power distribution strategy
   - **Export**: CSV and PDF report generation
 
 - **Dark/Light Theme Toggle**: Switch between Catppuccin dark and light color schemes
@@ -36,8 +37,6 @@ A physics-based cycling power simulation with a graphical user interface. Calcul
 - **Interval/Workout Simulator**: Define power intervals (e.g., 5min @ 300W, 2min @ 150W) and see speed, distance, and calories over time
 
 - **Animated Ride Playback**: Watch a dot traverse the course elevation profile in real time
-
-- **Leaderboard**: Save course results with rider/course names, track best times
 
 - **Drag & Drop Segment Reordering**: Move segments up/down in the course profile
 
@@ -54,6 +53,12 @@ A physics-based cycling power simulation with a graphical user interface. Calcul
 - **3D Course Visualization**: Matplotlib 3D terrain view with gradient-colored path, start/finish markers
 
 - **Gradient-Colored Route Map**: Load GPX files and visualize routes colored by grade percentage with colorbar legend
+
+- **Elevation Heatmap Overlay**: 3D surface visualization with elevation-based color mapping on the 3D course view
+
+- **Critical Power Model (CP & W')**: Estimate or fit the 2-parameter critical power model, view power-duration curves, time-to-exhaustion analysis, and W' balance
+
+- **Route Optimization / Pacing Strategy**: Optimal power distribution across course segments — push harder on climbs, ease on descents, with time savings vs even-pace comparison
 
 - **Input Validation**: Real-time feedback for out-of-range parameter values
 
@@ -127,7 +132,7 @@ Speed is found iteratively using Newton's method to solve this nonlinear equatio
 python -m unittest tests -v
 ```
 
-97 unit tests covering physics, validation, unit conversions, wind direction, wheel inertia, course profiles, workout simulation, power zones, GPX parsing, leaderboard, preset save/load, CSV/workout export, power-to-weight ratio, rider classification, race simulation, and GPX coordinate parsing.
+109 unit tests covering physics, validation, unit conversions, wind direction, wheel inertia, course profiles, workout simulation, power zones, GPX parsing, preset save/load, CSV/workout export, power-to-weight ratio, rider classification, race simulation, GPX coordinate parsing, critical power model, and route optimization.
 
 ## License
 

@@ -925,6 +925,216 @@ def parse_gpx_with_coords(filepath: str | Path) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Critical Power Model (CP & W')
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CriticalPowerModel:
+    """2-parameter critical power model (CP + W')."""
+    cp_watts: float
+    w_prime_joules: float
+
+    def max_power_for_duration(self, duration_s: float) -> float:
+        """Max sustainable power for a given duration."""
+        if duration_s <= 0:
+            return self.cp_watts + self.w_prime_joules
+        return self.cp_watts + self.w_prime_joules / duration_s
+
+    def time_to_exhaustion(self, power_watts: float) -> float:
+        """Time until W' is depleted at given power above CP."""
+        if power_watts <= self.cp_watts:
+            return float("inf")
+        return self.w_prime_joules / (power_watts - self.cp_watts)
+
+    def w_prime_balance(self, power_watts: float, duration_s: float) -> float:
+        """Remaining W' after exercising at given power for duration."""
+        if power_watts <= self.cp_watts:
+            return self.w_prime_joules
+        expenditure = (power_watts - self.cp_watts) * duration_s
+        return max(0.0, self.w_prime_joules - expenditure)
+
+    def power_curve(self, durations_s: list[float] | None = None) -> tuple[list[float], list[float]]:
+        """Generate power-duration curve."""
+        if durations_s is None:
+            durations_s = [5, 10, 15, 30, 60, 120, 180, 300, 600,
+                           900, 1200, 1800, 3600, 5400, 7200]
+        powers = [self.max_power_for_duration(d) for d in durations_s]
+        return durations_s, powers
+
+
+def estimate_cp_from_ftp(ftp: float) -> CriticalPowerModel:
+    """Estimate CP and W' from FTP using common relationship.
+
+    CP is typically ~95-97% of FTP. W' varies by athlete type
+    but 15-25 kJ is typical for trained cyclists.
+    """
+    cp = ftp * 0.96
+    w_prime = 20000.0  # 20 kJ default
+    return CriticalPowerModel(cp_watts=cp, w_prime_joules=w_prime)
+
+
+def fit_cp_model(power1: float, duration1: float,
+                 power2: float, duration2: float) -> CriticalPowerModel:
+    """Fit CP model from two power-duration data points.
+
+    Uses the linear form: work = CP * t + W'
+    """
+    work1 = power1 * duration1
+    work2 = power2 * duration2
+    dt = duration1 - duration2
+    if abs(dt) < 1e-6:
+        return estimate_cp_from_ftp(power1)
+    cp = (work1 - work2) / dt
+    w_prime = work1 - cp * duration1
+    cp = max(50, cp)
+    w_prime = max(1000, w_prime)
+    return CriticalPowerModel(cp_watts=cp, w_prime_joules=w_prime)
+
+
+# ---------------------------------------------------------------------------
+# Route optimization (pacing strategy)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PacingSegment:
+    """Optimal power/speed for a single segment."""
+    segment_index: int
+    distance_m: float
+    grade_pct: float
+    optimal_power: float
+    speed_kmh: float
+    time_s: float
+    strategy_note: str
+
+
+@dataclass
+class PacingResult:
+    """Result of route optimization."""
+    segments: list[PacingSegment]
+    total_time_s: float
+    avg_power: float
+    total_distance_m: float
+    avg_speed_kmh: float
+    time_saved_s: float
+    even_pace_time_s: float
+
+
+def optimize_pacing(
+    rider: RiderParams,
+    bike: BikeParams,
+    course_segments: list[CourseSegment],
+    ftp: float,
+    target_avg_power: float | None = None,
+) -> PacingResult:
+    """Find optimal pacing for a course.
+
+    Uses a simple negative-split strategy:
+    - Push harder on climbs (where extra power yields more time savings)
+    - Ease off on descents (where aero drag limits gains)
+    - Push harder on flat/headwind segments (better power-to-time ratio)
+    """
+    if target_avg_power is None:
+        target_avg_power = ftp * 0.85
+
+    even_power = target_avg_power
+    even_total_time = 0.0
+    for seg in course_segments:
+        course = CourseParams(
+            grade_pct=seg.grade_pct, headwind_kmh=seg.headwind_kmh,
+            wind_direction_deg=seg.wind_direction_deg,
+            elevation_m=seg.elevation_m, temperature_c=seg.temperature_c,
+        )
+        result = solve_speed(rider, bike, course, power_override=even_power)
+        even_total_time += seg.distance_m / max(result.speed_ms, 0.1)
+
+    power_factors: list[float] = []
+    for seg in course_segments:
+        if seg.grade_pct > 5:
+            factor = 1.15
+            note = "Hard climb push"
+        elif seg.grade_pct > 2:
+            factor = 1.08
+            note = "Moderate climb push"
+        elif seg.grade_pct > 0:
+            factor = 1.03
+            note = "Slight incline push"
+        elif seg.grade_pct > -2:
+            factor = 0.98
+            note = "Flat/slight descent ease"
+        elif seg.grade_pct > -5:
+            factor = 0.88
+            note = "Descent recovery"
+        else:
+            factor = 0.75
+            note = "Steep descent coast"
+        power_factors.append(factor)
+
+    total_weight = sum(
+        f * seg.distance_m for f, seg in zip(power_factors, course_segments)
+    )
+    total_dist = sum(seg.distance_m for seg in course_segments)
+    scale = target_avg_power * total_dist / total_weight if total_weight > 0 else 1.0
+
+    pacing_segments: list[PacingSegment] = []
+    total_time = 0.0
+    total_power_dist = 0.0
+
+    notes = ["Hard climb push", "Moderate climb push", "Slight incline push",
+             "Flat/slight descent ease", "Descent recovery", "Steep descent coast"]
+
+    for i, seg in enumerate(course_segments):
+        optimal_power = power_factors[i] * scale
+        optimal_power = max(50, min(optimal_power, ftp * 1.20))
+
+        course = CourseParams(
+            grade_pct=seg.grade_pct, headwind_kmh=seg.headwind_kmh,
+            wind_direction_deg=seg.wind_direction_deg,
+            elevation_m=seg.elevation_m, temperature_c=seg.temperature_c,
+        )
+        result = solve_speed(rider, bike, course,
+                             power_override=optimal_power)
+        time_s = seg.distance_m / max(result.speed_ms, 0.1)
+
+        if seg.grade_pct > 5:
+            note = "Hard climb push"
+        elif seg.grade_pct > 2:
+            note = "Moderate climb push"
+        elif seg.grade_pct > 0:
+            note = "Slight incline push"
+        elif seg.grade_pct > -2:
+            note = "Flat/slight descent ease"
+        elif seg.grade_pct > -5:
+            note = "Descent recovery"
+        else:
+            note = "Steep descent coast"
+
+        pacing_segments.append(PacingSegment(
+            segment_index=i,
+            distance_m=seg.distance_m,
+            grade_pct=seg.grade_pct,
+            optimal_power=optimal_power,
+            speed_kmh=result.speed_kmh,
+            time_s=time_s,
+            strategy_note=note,
+        ))
+        total_time += time_s
+        total_power_dist += optimal_power * seg.distance_m
+
+    avg_power = total_power_dist / total_dist if total_dist > 0 else 0
+    avg_speed = (total_dist / total_time * 3.6) if total_time > 0 else 0
+
+    return PacingResult(
+        segments=pacing_segments,
+        total_time_s=total_time,
+        avg_power=avg_power,
+        total_distance_m=total_dist,
+        avg_speed_kmh=avg_speed,
+        time_saved_s=even_total_time - total_time,
+        even_pace_time_s=even_total_time,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Leaderboard
 # ---------------------------------------------------------------------------
 
