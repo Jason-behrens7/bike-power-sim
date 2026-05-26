@@ -15,12 +15,15 @@ from simulation import (
     IntervalStep,
     LeaderboardEntry,
     Preset,
+    RaceCompetitor,
+    RIDER_CATEGORIES,
     RiderParams,
     RidingPosition,
     TireType,
     ZONE_NAMES,
     air_density,
     calculate_cda,
+    classify_rider,
     effective_headwind,
     estimate_calories,
     estimate_frontal_area,
@@ -32,16 +35,20 @@ from simulation import (
     load_leaderboard,
     load_presets,
     parse_gpx,
+    parse_gpx_with_coords,
+    power_to_weight_ratio,
     power_zones,
     resistive_forces,
     save_leaderboard,
     save_presets,
     simulate_course_profile,
+    simulate_race,
     simulate_workout,
     solve_speed,
     speed_vs_power_curve,
     validate_all,
     validate_param,
+    w_per_kg_analysis,
     wheel_inertia_factor,
     zone_for_power,
     # Unit conversions
@@ -586,6 +593,188 @@ class TestLeaderboard(unittest.TestCase):
     def test_load_nonexistent_returns_empty(self) -> None:
         loaded = load_leaderboard("/tmp/nonexistent_leaderboard_xyz.json")
         self.assertEqual(loaded, [])
+
+
+# -----------------------------------------------------------------------
+# Phase 4 feature tests
+# -----------------------------------------------------------------------
+
+class TestPowerToWeightRatio(unittest.TestCase):
+    def test_basic_calculation(self) -> None:
+        w_kg = power_to_weight_ratio(300, 75)
+        self.assertAlmostEqual(w_kg, 4.0)
+
+    def test_zero_weight_returns_zero(self) -> None:
+        w_kg = power_to_weight_ratio(300, 0)
+        self.assertEqual(w_kg, 0.0)
+
+    def test_higher_power_higher_ratio(self) -> None:
+        low = power_to_weight_ratio(200, 75)
+        high = power_to_weight_ratio(400, 75)
+        self.assertGreater(high, low)
+
+    def test_lighter_rider_higher_ratio(self) -> None:
+        heavy = power_to_weight_ratio(300, 90)
+        light = power_to_weight_ratio(300, 60)
+        self.assertGreater(light, heavy)
+
+
+class TestRiderClassification(unittest.TestCase):
+    def test_beginner(self) -> None:
+        cat = classify_rider(2.0)
+        self.assertEqual(cat, "Cat 5 / Beginner")
+
+    def test_cat4(self) -> None:
+        cat = classify_rider(3.0)
+        self.assertEqual(cat, "Cat 4")
+
+    def test_cat3(self) -> None:
+        cat = classify_rider(3.8)
+        self.assertEqual(cat, "Cat 3")
+
+    def test_cat2(self) -> None:
+        cat = classify_rider(4.5)
+        self.assertEqual(cat, "Cat 2")
+
+    def test_cat1(self) -> None:
+        cat = classify_rider(5.5)
+        self.assertEqual(cat, "Cat 1 / Elite")
+
+    def test_world_tour(self) -> None:
+        cat = classify_rider(6.5)
+        self.assertEqual(cat, "World Tour Pro")
+
+    def test_zero_wkg(self) -> None:
+        cat = classify_rider(0.0)
+        self.assertEqual(cat, "Cat 5 / Beginner")
+
+
+class TestWPerKgAnalysis(unittest.TestCase):
+    def test_returns_correct_keys(self) -> None:
+        analysis = w_per_kg_analysis(250, 75)
+        self.assertIn("w_per_kg", analysis)
+        self.assertIn("category", analysis)
+        self.assertIn("ftp", analysis)
+        self.assertIn("weight_kg", analysis)
+        self.assertIn("categories", analysis)
+
+    def test_correct_w_per_kg(self) -> None:
+        analysis = w_per_kg_analysis(300, 75)
+        self.assertAlmostEqual(analysis["w_per_kg"], 4.0)
+
+    def test_categories_list(self) -> None:
+        analysis = w_per_kg_analysis(250, 75)
+        self.assertEqual(len(analysis["categories"]), 6)
+
+
+class TestRaceSimulation(unittest.TestCase):
+    def test_single_competitor(self) -> None:
+        comps = [RaceCompetitor("Alice", 250, 65)]
+        segs = [CourseSegment(distance_m=5000, grade_pct=0)]
+        results = simulate_race(comps, segs)
+        self.assertEqual(len(results), 1)
+        self.assertGreater(results[0].total_time_s, 0)
+        self.assertAlmostEqual(results[0].gap_to_leader_s, 0.0)
+
+    def test_multiple_competitors_sorted(self) -> None:
+        comps = [
+            RaceCompetitor("Weak", 150, 80),
+            RaceCompetitor("Strong", 350, 70),
+        ]
+        segs = [CourseSegment(distance_m=5000, grade_pct=0)]
+        results = simulate_race(comps, segs)
+        self.assertEqual(results[0].name, "Strong")
+        self.assertEqual(results[1].name, "Weak")
+        self.assertGreater(results[1].gap_to_leader_s, 0)
+
+    def test_multi_segment_race(self) -> None:
+        comps = [
+            RaceCompetitor("Alice", 250, 65),
+            RaceCompetitor("Bob", 300, 80),
+        ]
+        segs = [
+            CourseSegment(distance_m=2000, grade_pct=0),
+            CourseSegment(distance_m=1000, grade_pct=5),
+            CourseSegment(distance_m=2000, grade_pct=-3),
+        ]
+        results = simulate_race(comps, segs)
+        self.assertEqual(len(results), 2)
+        for r in results:
+            self.assertEqual(len(r.segment_speeds), 3)
+            self.assertEqual(len(r.segment_times), 3)
+            self.assertEqual(len(r.cumulative_distances), 4)
+
+    def test_climber_advantage_uphill(self) -> None:
+        comps = [
+            RaceCompetitor("Heavy", 300, 90),
+            RaceCompetitor("Light", 260, 60),
+        ]
+        segs = [CourseSegment(distance_m=5000, grade_pct=8)]
+        results = simulate_race(comps, segs)
+        self.assertEqual(results[0].name, "Light")
+
+    def test_cumulative_distances(self) -> None:
+        comps = [RaceCompetitor("Test", 250, 75)]
+        segs = [
+            CourseSegment(distance_m=1000, grade_pct=0),
+            CourseSegment(distance_m=2000, grade_pct=0),
+        ]
+        results = simulate_race(comps, segs)
+        self.assertAlmostEqual(results[0].cumulative_distances[0], 0)
+        self.assertAlmostEqual(results[0].cumulative_distances[1], 1000)
+        self.assertAlmostEqual(results[0].cumulative_distances[2], 3000)
+
+
+class TestGPXWithCoords(unittest.TestCase):
+    def test_parse_with_coords(self) -> None:
+        gpx_content = """<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" xmlns="http://www.topografix.com/GPX/1/1">
+  <trk><trkseg>
+    <trkpt lat="47.0" lon="8.0"><ele>500</ele></trkpt>
+    <trkpt lat="47.002" lon="8.0"><ele>510</ele></trkpt>
+    <trkpt lat="47.004" lon="8.0"><ele>505</ele></trkpt>
+  </trkseg></trk>
+</gpx>"""
+        with tempfile.NamedTemporaryFile(suffix=".gpx", delete=False, mode="w") as f:
+            f.write(gpx_content)
+            path = f.name
+        points = parse_gpx_with_coords(path)
+        self.assertEqual(len(points), 3)
+        self.assertIn("lat", points[0])
+        self.assertIn("lon", points[0])
+        self.assertIn("ele", points[0])
+        self.assertIn("distance_m", points[0])
+        self.assertIn("grade_pct", points[0])
+        self.assertAlmostEqual(points[0]["distance_m"], 0.0)
+        self.assertGreater(points[1]["distance_m"], 0)
+        Path(path).unlink()
+
+    def test_empty_gpx_with_coords(self) -> None:
+        gpx_content = """<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" xmlns="http://www.topografix.com/GPX/1/1">
+  <trk><trkseg></trkseg></trk>
+</gpx>"""
+        with tempfile.NamedTemporaryFile(suffix=".gpx", delete=False, mode="w") as f:
+            f.write(gpx_content)
+            path = f.name
+        points = parse_gpx_with_coords(path)
+        self.assertEqual(len(points), 0)
+        Path(path).unlink()
+
+    def test_grade_calculation(self) -> None:
+        gpx_content = """<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" xmlns="http://www.topografix.com/GPX/1/1">
+  <trk><trkseg>
+    <trkpt lat="47.0" lon="8.0"><ele>500</ele></trkpt>
+    <trkpt lat="47.001" lon="8.0"><ele>510</ele></trkpt>
+  </trkseg></trk>
+</gpx>"""
+        with tempfile.NamedTemporaryFile(suffix=".gpx", delete=False, mode="w") as f:
+            f.write(gpx_content)
+            path = f.name
+        points = parse_gpx_with_coords(path)
+        self.assertGreater(points[1]["grade_pct"], 0)
+        Path(path).unlink()
 
 
 if __name__ == "__main__":

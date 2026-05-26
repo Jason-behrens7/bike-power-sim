@@ -25,12 +25,15 @@ from simulation import (
     LeaderboardEntry,
     PRESETS,
     Preset,
+    RaceCompetitor,
+    RIDER_CATEGORIES,
     RiderParams,
     RidingPosition,
     SimulationResult,
     TireType,
     ZONE_COLORS,
     ZONE_NAMES,
+    classify_rider,
     estimate_calories,
     export_comparison_csv,
     export_course_csv,
@@ -39,14 +42,18 @@ from simulation import (
     load_leaderboard,
     load_presets,
     parse_gpx,
+    parse_gpx_with_coords,
+    power_to_weight_ratio,
     power_zones,
     save_leaderboard,
     save_presets,
     simulate_course_profile,
+    simulate_race,
     simulate_workout,
     solve_speed,
     speed_vs_power_curve,
     validate_all,
+    w_per_kg_analysis,
     zone_for_power,
     # Unit conversions
     kg_to_lbs, lbs_to_kg,
@@ -226,6 +233,9 @@ class BikeSimApp(tk.Tk):
         self._build_workout_tab()
         self._build_compare_tab()
         self._build_leaderboard_tab()
+        self._build_pw_ratio_tab()
+        self._build_race_tab()
+        self._build_3d_tab()
         self._build_export_tab()
 
     # ==================================================================
@@ -353,6 +363,10 @@ class BikeSimApp(tk.Tk):
         # Calories display
         self.lbl_calories = ttk.Label(frame, text="", style="Small.TLabel")
         self.lbl_calories.pack(side=tk.RIGHT, padx=8)
+
+        # W/kg display
+        self.lbl_wkg = ttk.Label(frame, text="", style="Small.TLabel")
+        self.lbl_wkg.pack(side=tk.RIGHT, padx=8)
 
         # Power zone display
         self.lbl_zone = ttk.Label(frame, text="", style="Small.TLabel")
@@ -905,7 +919,501 @@ class BikeSimApp(tk.Tk):
         self._refresh_leaderboard()
 
     # ==================================================================
-    # TAB 6: Export
+    # TAB 6: Power-to-Weight Ratio Analysis
+    # ==================================================================
+    def _build_pw_ratio_tab(self) -> None:
+        tab = ttk.Frame(self._notebook)
+        self._notebook.add(tab, text="  W/kg Analysis  ")
+
+        left = ttk.Frame(tab)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, padx=8, pady=4)
+
+        right = ttk.Frame(tab)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=4)
+
+        info_frame = ttk.LabelFrame(left, text="Your Power-to-Weight")
+        info_frame.pack(fill=tk.X, pady=(0, 6))
+
+        ttk.Button(info_frame, text="Analyze Current Settings",
+                   command=self._run_pw_analysis).pack(fill=tk.X, padx=8, pady=4)
+
+        self.lbl_pw_ratio = ttk.Label(info_frame, text="", style="Result.TLabel")
+        self.lbl_pw_ratio.pack(padx=8, pady=4)
+        self.lbl_pw_unit = ttk.Label(info_frame, text="W/kg", style="ResultUnit.TLabel")
+        self.lbl_pw_unit.pack(padx=8)
+
+        self.lbl_pw_category = ttk.Label(info_frame, text="",
+                                          font=("Segoe UI", 14, "bold"))
+        self.lbl_pw_category.pack(padx=8, pady=8)
+
+        self.lbl_pw_details = ttk.Label(info_frame, text="", style="Small.TLabel",
+                                         wraplength=280, justify=tk.LEFT)
+        self.lbl_pw_details.pack(fill=tk.X, padx=8, pady=4)
+
+        cat_frame = ttk.LabelFrame(left, text="Category Reference")
+        cat_frame.pack(fill=tk.X, pady=(0, 6))
+
+        ref_text = ""
+        for name, lo, hi in RIDER_CATEGORIES:
+            if hi == float("inf"):
+                ref_text += f"  {name}: {lo:.1f}+ W/kg\n"
+            else:
+                ref_text += f"  {name}: {lo:.1f} - {hi:.1f} W/kg\n"
+        ttk.Label(cat_frame, text=ref_text.strip(), style="Small.TLabel",
+                  justify=tk.LEFT).pack(padx=8, pady=4)
+
+        t = self._theme
+        self.fig_pw = Figure(figsize=(7, 5), dpi=100, facecolor=t["BG"])
+        self.fig_pw.subplots_adjust(hspace=0.40, left=0.12, right=0.95,
+                                     top=0.94, bottom=0.10)
+        self.ax_pw_bar = self.fig_pw.add_subplot(211)
+        self.ax_pw_curve = self.fig_pw.add_subplot(212)
+        self.canvas_pw = FigureCanvasTkAgg(self.fig_pw, master=right)
+        self.canvas_pw.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    def _run_pw_analysis(self) -> None:
+        ftp = self.var_ftp.get()
+        weight = self.var_rider_weight.get()
+        analysis = w_per_kg_analysis(ftp, weight)
+
+        w_kg = analysis["w_per_kg"]
+        category = analysis["category"]
+
+        self.lbl_pw_ratio.configure(text=f"{w_kg:.2f}")
+        self.lbl_pw_category.configure(text=category)
+
+        details = (
+            f"FTP: {ftp:.0f} W\n"
+            f"Weight: {weight:.1f} kg\n"
+            f"W/kg: {w_kg:.2f}\n\n"
+            f"Category: {category}"
+        )
+        self.lbl_pw_details.configure(text=details)
+        self._update_pw_charts(w_kg, ftp, weight)
+
+    def _update_pw_charts(self, w_kg: float, ftp: float, weight: float) -> None:
+        t = self._theme
+        chart_colors = [t[k] for k in CHART_COLOURS_KEYS]
+
+        ax1 = self.ax_pw_bar
+        ax1.clear()
+        _style_ax(ax1, t)
+
+        cat_names = [c[0] for c in RIDER_CATEGORIES]
+        cat_ranges = [(c[1], min(c[2], 8.0)) for c in RIDER_CATEGORIES]
+        colors = []
+        for c_name in cat_names:
+            if c_name == classify_rider(w_kg):
+                colors.append(t["ACCENT2"])
+            else:
+                colors.append(t["ACCENT"])
+
+        cat_names_rev = list(reversed(cat_names))
+        bottoms = [c[0] for c in reversed(cat_ranges)]
+        heights = [c[1] - c[0] for c in reversed(cat_ranges)]
+        colors_rev = list(reversed(colors))
+
+        bars = ax1.barh(cat_names_rev, heights, left=bottoms,
+                        color=colors_rev, edgecolor=t["BORDER"], alpha=0.8)
+        ax1.axvline(w_kg, color=t["ACCENT4"], linewidth=2, linestyle="--",
+                    label=f"You: {w_kg:.2f} W/kg")
+        ax1.set_xlabel("W/kg", color=t["FG"], fontsize=9)
+        ax1.set_title("Rider Classification", color=t["FG"],
+                      fontsize=11, fontweight="bold")
+        ax1.legend(fontsize=8, facecolor=t["BG_LIGHT"], edgecolor=t["BORDER"],
+                   labelcolor=t["FG"])
+
+        ax2 = self.ax_pw_curve
+        ax2.clear()
+        _style_ax(ax2, t)
+
+        weights = list(range(50, 110))
+        w_per_kgs = [ftp / w for w in weights]
+        ax2.plot(weights, w_per_kgs, color=t["ACCENT"], linewidth=2)
+        ax2.axvline(weight, color=t["ACCENT4"], linestyle="--", linewidth=1,
+                    label=f"Your weight: {weight:.0f} kg")
+        ax2.axhline(w_kg, color=t["ACCENT2"], linestyle=":", linewidth=1,
+                    alpha=0.7, label=f"Your W/kg: {w_kg:.2f}")
+
+        for name, lo, hi in RIDER_CATEGORIES:
+            if hi == float("inf"):
+                hi = 8.0
+            ax2.axhspan(lo, hi, alpha=0.06, color=t["ACCENT3"])
+
+        ax2.fill_between(weights, w_per_kgs, alpha=0.15, color=t["ACCENT"])
+        ax2.set_xlabel("Rider Weight (kg)", color=t["FG"], fontsize=9)
+        ax2.set_ylabel("W/kg at current FTP", color=t["FG"], fontsize=9)
+        ax2.set_title(f"W/kg vs Weight (FTP={ftp:.0f}W)", color=t["FG"],
+                      fontsize=11, fontweight="bold")
+        ax2.legend(fontsize=8, facecolor=t["BG_LIGHT"], edgecolor=t["BORDER"],
+                   labelcolor=t["FG"])
+
+        self.canvas_pw.draw_idle()
+
+    # ==================================================================
+    # TAB 7: Race Simulation
+    # ==================================================================
+    def _build_race_tab(self) -> None:
+        tab = ttk.Frame(self._notebook)
+        self._notebook.add(tab, text="  Race  ")
+
+        left = ttk.Frame(tab)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, padx=8, pady=4)
+
+        right = ttk.Frame(tab)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=4)
+
+        comp_frame = ttk.LabelFrame(left, text="Competitors")
+        comp_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+
+        btn_row = ttk.Frame(comp_frame)
+        btn_row.pack(fill=tk.X, padx=4, pady=4)
+        ttk.Button(btn_row, text="Add Competitor", style="Preset.TButton",
+                   command=self._add_race_competitor).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_row, text="Add Me (Current)", style="Preset.TButton",
+                   command=self._add_me_as_competitor).pack(side=tk.LEFT, padx=2)
+        ttk.Button(btn_row, text="Remove Selected", style="Preset.TButton",
+                   command=self._remove_race_competitor).pack(side=tk.LEFT, padx=2)
+
+        self._race_competitors: list[RaceCompetitor] = []
+        self._race_listbox = tk.Listbox(comp_frame, bg=self._theme["ENTRY_BG"],
+                                         fg=self._theme["FG"], height=8,
+                                         selectmode=tk.SINGLE,
+                                         font=("Segoe UI", 9))
+        self._race_listbox.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        # Pre-populate with virtual competitors
+        self._race_competitors = [
+            RaceCompetitor("You", 250, 75, 178, 8.0),
+            RaceCompetitor("Strong Rider", 300, 72, 175, 7.5,
+                           position=RidingPosition.DROPS),
+            RaceCompetitor("TT Specialist", 320, 78, 182, 8.0,
+                           position=RidingPosition.AEROBARS),
+            RaceCompetitor("Climber", 260, 60, 170, 6.5,
+                           tire_type=TireType.ROAD_RACING),
+        ]
+        self._refresh_race_listbox()
+
+        btn_row2 = ttk.Frame(comp_frame)
+        btn_row2.pack(fill=tk.X, padx=4, pady=4)
+        ttk.Button(btn_row2, text="Run Race",
+                   command=self._run_race).pack(side=tk.RIGHT, padx=2)
+
+        self.lbl_race_results = ttk.Label(left, text="", style="Small.TLabel",
+                                           wraplength=300, justify=tk.LEFT)
+        self.lbl_race_results.pack(fill=tk.X, pady=4)
+
+        t = self._theme
+        self.fig_race = Figure(figsize=(7, 5), dpi=100, facecolor=t["BG"])
+        self.fig_race.subplots_adjust(hspace=0.40, left=0.10, right=0.95,
+                                       top=0.94, bottom=0.14)
+        self.ax_race_speed = self.fig_race.add_subplot(211)
+        self.ax_race_time = self.fig_race.add_subplot(212)
+        self.canvas_race = FigureCanvasTkAgg(self.fig_race, master=right)
+        self.canvas_race.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    def _refresh_race_listbox(self) -> None:
+        self._race_listbox.delete(0, tk.END)
+        for c in self._race_competitors:
+            w_kg = power_to_weight_ratio(c.power_watts, c.weight_kg)
+            self._race_listbox.insert(
+                tk.END,
+                f"{c.name}: {c.power_watts:.0f}W / {c.weight_kg:.0f}kg "
+                f"({w_kg:.1f} W/kg)"
+            )
+
+    def _add_race_competitor(self) -> None:
+        name = simpledialog.askstring("Competitor", "Name:", parent=self)
+        if not name:
+            return
+        power = simpledialog.askfloat("Competitor", "Power (W):",
+                                       initialvalue=250, parent=self)
+        weight = simpledialog.askfloat("Competitor", "Weight (kg):",
+                                        initialvalue=75, parent=self)
+        if power is None or weight is None:
+            return
+        self._race_competitors.append(
+            RaceCompetitor(name, power, weight)
+        )
+        self._refresh_race_listbox()
+
+    def _add_me_as_competitor(self) -> None:
+        rider, bike, _ = self._gather_params()
+        ftp = self.var_ftp.get()
+        comp = RaceCompetitor(
+            name="You",
+            power_watts=ftp,
+            weight_kg=rider.weight_kg,
+            height_cm=rider.height_cm,
+            bike_weight_kg=bike.weight_kg,
+            tire_type=bike.tire_type,
+            position=bike.position,
+            drivetrain_efficiency=bike.drivetrain_efficiency,
+        )
+        self._race_competitors.append(comp)
+        self._refresh_race_listbox()
+
+    def _remove_race_competitor(self) -> None:
+        sel = self._race_listbox.curselection()
+        if sel:
+            self._race_competitors.pop(sel[0])
+            self._refresh_race_listbox()
+
+    def _run_race(self) -> None:
+        if not self._race_competitors:
+            messagebox.showwarning("No Competitors", "Add at least one competitor.")
+            return
+
+        segments: list[CourseSegment] = []
+        for sv in self._course_segments:
+            try:
+                segments.append(CourseSegment(
+                    distance_m=sv["distance"].get(),
+                    grade_pct=sv["grade"].get(),
+                    headwind_kmh=sv["wind"].get(),
+                    wind_direction_deg=sv["wind_dir"].get(),
+                    elevation_m=sv["elevation"].get(),
+                    temperature_c=sv["temperature"].get(),
+                ))
+            except (tk.TclError, ValueError):
+                pass
+
+        if not segments:
+            segments = [
+                CourseSegment(distance_m=5000, grade_pct=0),
+                CourseSegment(distance_m=2000, grade_pct=5),
+                CourseSegment(distance_m=3000, grade_pct=-3),
+                CourseSegment(distance_m=5000, grade_pct=0),
+                CourseSegment(distance_m=1000, grade_pct=8),
+                CourseSegment(distance_m=4000, grade_pct=-2),
+            ]
+
+        race_results = simulate_race(self._race_competitors, segments)
+
+        result_text = "Race Results:\n"
+        for i, r in enumerate(race_results):
+            mins = int(r.total_time_s // 60)
+            secs = int(r.total_time_s % 60)
+            gap = f"+{r.gap_to_leader_s:.1f}s" if r.gap_to_leader_s > 0 else "Leader"
+            result_text += (
+                f"  {i+1}. {r.name}: {mins}:{secs:02d} "
+                f"({r.avg_speed_kmh:.1f} km/h) {gap}\n"
+            )
+        self.lbl_race_results.configure(text=result_text.strip())
+        self._update_race_charts(race_results, segments)
+
+    def _update_race_charts(self, race_results: list, segments: list) -> None:
+        t = self._theme
+        chart_colors = [t[k] for k in CHART_COLOURS_KEYS]
+
+        ax1 = self.ax_race_speed
+        ax1.clear()
+        _style_ax(ax1, t)
+
+        total_dist = sum(s.distance_m for s in segments)
+        for i, r in enumerate(race_results):
+            color = chart_colors[i % len(chart_colors)]
+            mid_d = []
+            cum = 0.0
+            for j, seg in enumerate(segments):
+                mid_d.append((cum + seg.distance_m / 2) / 1000)
+                cum += seg.distance_m
+            ax1.plot(mid_d, r.segment_speeds, color=color, linewidth=1.5,
+                     marker="o", markersize=4, label=r.name)
+
+        ax1.set_xlabel("Distance (km)", color=t["FG"], fontsize=9)
+        ax1.set_ylabel("Speed (km/h)", color=t["FG"], fontsize=9)
+        ax1.set_title("Speed by Segment", color=t["FG"], fontsize=11,
+                      fontweight="bold")
+        ax1.legend(fontsize=7, facecolor=t["BG_LIGHT"], edgecolor=t["BORDER"],
+                   labelcolor=t["FG"], loc="best")
+
+        ax2 = self.ax_race_time
+        ax2.clear()
+        _style_ax(ax2, t)
+
+        names = [r.name for r in race_results]
+        times = [r.total_time_s for r in race_results]
+        colors = [chart_colors[i % len(chart_colors)]
+                  for i in range(len(race_results))]
+
+        bars = ax2.barh(names, times, color=colors, edgecolor=t["BORDER"],
+                        alpha=0.85)
+        for bar, r in zip(bars, race_results):
+            mins = int(r.total_time_s // 60)
+            secs = int(r.total_time_s % 60)
+            gap_txt = (f" (+{r.gap_to_leader_s:.1f}s)"
+                       if r.gap_to_leader_s > 0 else " (Leader)")
+            ax2.text(bar.get_width() + max(times) * 0.01,
+                     bar.get_y() + bar.get_height() / 2,
+                     f"{mins}:{secs:02d}{gap_txt}",
+                     va="center", color=t["FG"], fontsize=8)
+
+        ax2.set_xlabel("Time (s)", color=t["FG"], fontsize=9)
+        ax2.set_title("Race Standings", color=t["FG"], fontsize=11,
+                      fontweight="bold")
+
+        self.canvas_race.draw_idle()
+
+    # ==================================================================
+    # TAB 8: 3D Course Visualization & Gradient Map
+    # ==================================================================
+    def _build_3d_tab(self) -> None:
+        tab = ttk.Frame(self._notebook)
+        self._notebook.add(tab, text="  3D / Map  ")
+
+        top = ttk.Frame(tab)
+        top.pack(fill=tk.X, padx=8, pady=4)
+
+        ttk.Button(top, text="Show 3D Course",
+                   command=self._show_3d_course).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top, text="Load GPX for Gradient Map",
+                   command=self._show_gradient_map).pack(side=tk.LEFT, padx=4)
+
+        t = self._theme
+        self.fig_3d = Figure(figsize=(12, 5), dpi=100, facecolor=t["BG"])
+        self.fig_3d.subplots_adjust(left=0.06, right=0.98, top=0.94, bottom=0.08,
+                                     wspace=0.25)
+        self.ax_3d = self.fig_3d.add_subplot(121, projection="3d")
+        self.ax_gradient_map = self.fig_3d.add_subplot(122)
+        self.canvas_3d = FigureCanvasTkAgg(self.fig_3d, master=tab)
+        self.canvas_3d.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8)
+
+    def _show_3d_course(self) -> None:
+        if not self._last_course_result:
+            messagebox.showwarning("No Data", "Run a course profile first.")
+            return
+
+        result = self._last_course_result
+        t = self._theme
+
+        distances_km = [d / 1000 for d in result.distances_cumulative]
+        elevations = result.elevations
+
+        ax = self.ax_3d
+        ax.clear()
+
+        ax.set_facecolor(t["BG_LIGHT"])
+        ax.xaxis.pane.fill = False
+        ax.yaxis.pane.fill = False
+        ax.zaxis.pane.fill = False
+
+        n = len(distances_km)
+        x = distances_km
+        y = [0.0] * n
+        z = elevations
+
+        for i in range(n - 1):
+            grade = 0.0
+            dist_m = (x[i + 1] - x[i]) * 1000
+            if dist_m > 0:
+                grade = (z[i + 1] - z[i]) / dist_m * 100
+
+            if grade > 5:
+                color = "#f38ba8"
+            elif grade > 2:
+                color = "#fab387"
+            elif grade > 0:
+                color = "#f9e2af"
+            elif grade > -2:
+                color = "#a6e3a1"
+            else:
+                color = "#89b4fa"
+
+            ax.plot([x[i], x[i + 1]], [y[i], y[i + 1]], [z[i], z[i + 1]],
+                    color=color, linewidth=3)
+
+        if len(x) > 0:
+            ax.scatter([x[0]], [y[0]], [z[0]], color=t["ACCENT2"], s=80,
+                       marker="o", zorder=10, label="Start")
+            ax.scatter([x[-1]], [y[-1]], [z[-1]], color=t["ACCENT4"], s=80,
+                       marker="s", zorder=10, label="Finish")
+
+        width = max(0.02, (max(x) - min(x)) * 0.15) if len(x) > 1 else 0.1
+        for i in range(n):
+            ax.plot([x[i], x[i]], [-width, width], [z[i], z[i]],
+                    color=t["ACCENT2"], alpha=0.15, linewidth=0.5)
+
+        ax.set_xlabel("Distance (km)", color=t["FG"], fontsize=8, labelpad=8)
+        ax.set_ylabel("", color=t["FG"], fontsize=8)
+        ax.set_zlabel("Elevation (m)", color=t["FG"], fontsize=8, labelpad=8)
+        ax.set_title("3D Course Profile", color=t["FG"], fontsize=11,
+                     fontweight="bold")
+        ax.tick_params(colors=t["FG"], labelsize=7)
+        ax.set_yticks([])
+        ax.legend(fontsize=7, facecolor=t["BG_LIGHT"], edgecolor=t["BORDER"],
+                  labelcolor=t["FG"])
+
+        ax.view_init(elev=25, azim=-60)
+        self.canvas_3d.draw_idle()
+
+    def _show_gradient_map(self) -> None:
+        path = filedialog.askopenfilename(filetypes=[("GPX files", "*.gpx")])
+        if not path:
+            return
+        try:
+            points = parse_gpx_with_coords(path)
+            if not points:
+                messagebox.showwarning("GPX", "No trackpoints found.")
+                return
+            self._draw_gradient_map(points)
+        except Exception as e:
+            messagebox.showerror("GPX Error", str(e))
+
+    def _draw_gradient_map(self, points: list[dict]) -> None:
+        t = self._theme
+        ax = self.ax_gradient_map
+        ax.clear()
+        _style_ax(ax, t)
+
+        lats = [p["lat"] for p in points]
+        lons = [p["lon"] for p in points]
+        grades = [p["grade_pct"] for p in points]
+
+        import matplotlib.colors as mcolors
+        cmap = mcolors.LinearSegmentedColormap.from_list(
+            "grade",
+            [(0.0, "#89b4fa"), (0.25, "#a6e3a1"), (0.5, "#f9e2af"),
+             (0.75, "#fab387"), (1.0, "#f38ba8")]
+        )
+
+        max_abs_grade = max(abs(g) for g in grades) if grades else 10
+        max_abs_grade = max(max_abs_grade, 1.0)
+
+        for i in range(len(lons) - 1):
+            normalized = (grades[i] + max_abs_grade) / (2 * max_abs_grade)
+            normalized = max(0.0, min(1.0, normalized))
+            color = cmap(normalized)
+            ax.plot([lons[i], lons[i + 1]], [lats[i], lats[i + 1]],
+                    color=color, linewidth=3, solid_capstyle="round")
+
+        ax.scatter([lons[0]], [lats[0]], color=t["ACCENT2"], s=60,
+                   marker="o", zorder=10, label="Start")
+        ax.scatter([lons[-1]], [lats[-1]], color=t["ACCENT4"], s=60,
+                   marker="s", zorder=10, label="Finish")
+
+        sm = matplotlib.cm.ScalarMappable(
+            cmap=cmap,
+            norm=matplotlib.colors.Normalize(vmin=-max_abs_grade,
+                                             vmax=max_abs_grade)
+        )
+        sm.set_array([])
+        cbar = self.fig_3d.colorbar(sm, ax=ax, pad=0.02, aspect=30)
+        cbar.set_label("Grade (%)", color=t["FG"], fontsize=9)
+        cbar.ax.tick_params(colors=t["FG"], labelsize=7)
+
+        ax.set_xlabel("Longitude", color=t["FG"], fontsize=9)
+        ax.set_ylabel("Latitude", color=t["FG"], fontsize=9)
+        ax.set_title("Gradient-Colored Route Map", color=t["FG"],
+                     fontsize=11, fontweight="bold")
+        ax.legend(fontsize=7, facecolor=t["BG_LIGHT"], edgecolor=t["BORDER"],
+                  labelcolor=t["FG"])
+        ax.set_aspect("equal")
+
+        self.canvas_3d.draw_idle()
+
+    # ==================================================================
+    # TAB 9: Export
     # ==================================================================
     def _build_export_tab(self) -> None:
         tab = ttk.Frame(self._notebook)
@@ -1226,6 +1734,11 @@ class BikeSimApp(tk.Tk):
         ftp = self.var_ftp.get()
         zone_name, zone_color = zone_for_power(rider.power_watts, ftp)
         self.lbl_zone.configure(text=zone_name)
+
+        # W/kg on main tab
+        w_kg = power_to_weight_ratio(ftp, rider.weight_kg)
+        cat = classify_rider(w_kg)
+        self.lbl_wkg.configure(text=f"{w_kg:.2f} W/kg ({cat})")
 
         details = (
             f"Air density: {result.air_density:.3f} kg/m\u00b3  |  "

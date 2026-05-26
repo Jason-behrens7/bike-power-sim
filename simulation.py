@@ -148,6 +148,32 @@ class CourseProfileResult:
 
 
 @dataclass
+class RaceCompetitor:
+    """A virtual competitor for race simulation."""
+    name: str
+    power_watts: float
+    weight_kg: float
+    height_cm: float = 178.0
+    bike_weight_kg: float = 8.0
+    tire_type: TireType = TireType.ROAD_TRAINING
+    position: RidingPosition = RidingPosition.HOODS
+    drivetrain_efficiency: float = 0.97
+
+
+@dataclass
+class RaceResult:
+    """Result for a single competitor in a race simulation."""
+    name: str
+    total_time_s: float
+    avg_speed_kmh: float
+    segment_speeds: list[float]
+    segment_times: list[float]
+    cumulative_distances: list[float]
+    cumulative_times: list[float]
+    gap_to_leader_s: float = 0.0
+
+
+@dataclass
 class SimulationResult:
     """Complete result of a single simulation run."""
     speed_ms: float
@@ -226,6 +252,16 @@ ZONE_NAMES = ["Z1 Recovery", "Z2 Endurance", "Z3 Tempo",
 ZONE_COLORS = ["#89b4fa", "#a6e3a1", "#f9e2af", "#fab387",
                "#f38ba8", "#cba6f7", "#f5c2e7"]
 
+# Rider classification based on W/kg (male FTP benchmarks)
+RIDER_CATEGORIES = [
+    ("World Tour Pro", 6.0, float("inf")),
+    ("Cat 1 / Elite", 5.0, 6.0),
+    ("Cat 2", 4.2, 5.0),
+    ("Cat 3", 3.5, 4.2),
+    ("Cat 4", 2.8, 3.5),
+    ("Cat 5 / Beginner", 0.0, 2.8),
+]
+
 
 def power_zones(ftp: float) -> list[tuple[str, float, float, str]]:
     """Return power zones as (name, low_watts, high_watts, color) based on FTP."""
@@ -245,6 +281,34 @@ def zone_for_power(power: float, ftp: float) -> tuple[str, str]:
         if lo <= power < hi:
             return name, color
     return ZONE_NAMES[-1], ZONE_COLORS[-1]
+
+
+def power_to_weight_ratio(power_watts: float, rider_weight_kg: float) -> float:
+    """Calculate power-to-weight ratio in W/kg."""
+    if rider_weight_kg <= 0:
+        return 0.0
+    return power_watts / rider_weight_kg
+
+
+def classify_rider(w_per_kg: float) -> str:
+    """Classify rider based on W/kg into racing categories."""
+    for name, lo, hi in RIDER_CATEGORIES:
+        if lo <= w_per_kg < hi:
+            return name
+    return RIDER_CATEGORIES[-1][0]
+
+
+def w_per_kg_analysis(ftp: float, rider_weight_kg: float) -> dict:
+    """Provide comprehensive power-to-weight analysis."""
+    w_kg = power_to_weight_ratio(ftp, rider_weight_kg)
+    category = classify_rider(w_kg)
+    return {
+        "w_per_kg": w_kg,
+        "category": category,
+        "ftp": ftp,
+        "weight_kg": rider_weight_kg,
+        "categories": [(n, lo, hi) for n, lo, hi in RIDER_CATEGORIES],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -735,6 +799,129 @@ def parse_gpx(filepath: str | Path) -> list[CourseSegment]:
             seg_start = i
 
     return segments
+
+
+# ---------------------------------------------------------------------------
+# Race simulation
+# ---------------------------------------------------------------------------
+
+def simulate_race(
+    competitors: list[RaceCompetitor],
+    segments: list[CourseSegment],
+) -> list[RaceResult]:
+    """Simulate a race with multiple competitors on the same course."""
+    results: list[RaceResult] = []
+
+    for comp in competitors:
+        rider = RiderParams(
+            power_watts=comp.power_watts,
+            weight_kg=comp.weight_kg,
+            height_cm=comp.height_cm,
+        )
+        bike = BikeParams(
+            weight_kg=comp.bike_weight_kg,
+            tire_type=comp.tire_type,
+            position=comp.position,
+            drivetrain_efficiency=comp.drivetrain_efficiency,
+        )
+
+        seg_speeds: list[float] = []
+        seg_times: list[float] = []
+        cum_dists: list[float] = [0.0]
+        cum_times: list[float] = [0.0]
+        total_time = 0.0
+        total_dist = 0.0
+
+        for seg in segments:
+            course = CourseParams(
+                grade_pct=seg.grade_pct,
+                headwind_kmh=seg.headwind_kmh,
+                wind_direction_deg=seg.wind_direction_deg,
+                elevation_m=seg.elevation_m,
+                temperature_c=seg.temperature_c,
+            )
+            result = solve_speed(rider, bike, course,
+                                 power_override=comp.power_watts)
+            time_s = seg.distance_m / max(result.speed_ms, 0.1)
+            seg_speeds.append(result.speed_kmh)
+            seg_times.append(time_s)
+            total_time += time_s
+            total_dist += seg.distance_m
+            cum_dists.append(total_dist)
+            cum_times.append(total_time)
+
+        avg_speed = (total_dist / total_time * 3.6) if total_time > 0 else 0.0
+
+        results.append(RaceResult(
+            name=comp.name,
+            total_time_s=total_time,
+            avg_speed_kmh=avg_speed,
+            segment_speeds=seg_speeds,
+            segment_times=seg_times,
+            cumulative_distances=cum_dists,
+            cumulative_times=cum_times,
+        ))
+
+    if results:
+        best_time = min(r.total_time_s for r in results)
+        for r in results:
+            r.gap_to_leader_s = r.total_time_s - best_time
+
+    results.sort(key=lambda r: r.total_time_s)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# GPX lat/lon extraction for gradient map
+# ---------------------------------------------------------------------------
+
+def parse_gpx_with_coords(filepath: str | Path) -> list[dict]:
+    """Parse a GPX file and return trackpoints with lat, lon, ele, distance."""
+    tree = ET.parse(filepath)
+    root = tree.getroot()
+
+    ns = ""
+    if root.tag.startswith("{"):
+        ns = root.tag.split("}")[0] + "}"
+
+    trackpoints: list[tuple[float, float, float]] = []
+    for trkpt in root.iter(f"{ns}trkpt"):
+        lat = float(trkpt.attrib["lat"])
+        lon = float(trkpt.attrib["lon"])
+        ele_elem = trkpt.find(f"{ns}ele")
+        ele = float(ele_elem.text) if ele_elem is not None else 0.0
+        trackpoints.append((lat, lon, ele))
+
+    if len(trackpoints) < 2:
+        return []
+
+    result: list[dict] = []
+    cumulative_dist = 0.0
+    result.append({
+        "lat": trackpoints[0][0],
+        "lon": trackpoints[0][1],
+        "ele": trackpoints[0][2],
+        "distance_m": 0.0,
+        "grade_pct": 0.0,
+    })
+
+    for i in range(1, len(trackpoints)):
+        dist = _haversine(
+            trackpoints[i - 1][0], trackpoints[i - 1][1],
+            trackpoints[i][0], trackpoints[i][1],
+        )
+        cumulative_dist += dist
+        elev_change = trackpoints[i][2] - trackpoints[i - 1][2]
+        grade = (elev_change / dist * 100.0) if dist > 0 else 0.0
+        result.append({
+            "lat": trackpoints[i][0],
+            "lon": trackpoints[i][1],
+            "ele": trackpoints[i][2],
+            "distance_m": cumulative_dist,
+            "grade_pct": grade,
+        })
+
+    return result
 
 
 # ---------------------------------------------------------------------------

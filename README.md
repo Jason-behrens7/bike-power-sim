@@ -16,12 +16,15 @@ A physics-based cycling power simulation with a graphical user interface. Calcul
   - Wheel rotational inertia
   - Calorie & energy expenditure estimation
 
-- **Interactive Tabbed GUI** (6 tabs):
-  - **Simulation**: Real-time speed calculation with sliders, power zone display, calorie estimates
+- **Interactive Tabbed GUI** (9 tabs):
+  - **Simulation**: Real-time speed calculation with sliders, power zone display, calorie estimates, W/kg display
   - **Course Profile**: Multi-segment routes with GPX import, speed/elevation charts, animated ride playback
   - **Workout**: Interval/workout simulator with zone-colored power profiles
   - **Compare**: Side-by-side scenario comparison with bar charts
   - **Leaderboard**: Personal records on saved courses
+  - **W/kg Analysis**: Power-to-weight ratio with rider classification (Cat 5 to World Tour Pro)
+  - **Race**: Virtual race simulation with multiple competitors and gap analysis
+  - **3D / Map**: 3D course visualization and gradient-colored route map from GPX
   - **Export**: CSV and PDF report generation
 
 - **Dark/Light Theme Toggle**: Switch between Catppuccin dark and light color schemes
@@ -41,6 +44,16 @@ A physics-based cycling power simulation with a graphical user interface. Calcul
 - **PDF Report Generation**: Multi-page PDF with simulation parameters, speed-vs-power curve, power breakdown pie chart, and course profile charts
 
 - **Calorie Estimation**: Estimates kcal burned based on power output and metabolic efficiency (~25%)
+
+- **Power-to-Weight Ratio Analysis**: Calculate W/kg, classify riders from Cat 5/Beginner to World Tour Pro, visualize with category bar chart and weight sensitivity curve
+
+- **Rider Classification**: Automatic categorization based on FTP W/kg benchmarks (Cat 5 → Cat 1 → World Tour Pro)
+
+- **Race Simulation Mode**: Add virtual competitors with custom power/weight, race them on course segments, see speed comparisons and time gaps
+
+- **3D Course Visualization**: Matplotlib 3D terrain view with gradient-colored path, start/finish markers
+
+- **Gradient-Colored Route Map**: Load GPX files and visualize routes colored by grade percentage with colorbar legend
 
 - **Input Validation**: Real-time feedback for out-of-range parameter values
 
@@ -114,7 +127,7 @@ Speed is found iteratively using Newton's method to solve this nonlinear equatio
 python -m unittest tests -v
 ```
 
-75 unit tests covering physics, validation, unit conversions, wind direction, wheel inertia, course profiles, workout simulation, power zones, GPX parsing, leaderboard, preset save/load, and CSV/workout export.
+97 unit tests covering physics, validation, unit conversions, wind direction, wheel inertia, course profiles, workout simulation, power zones, GPX parsing, leaderboard, preset save/load, CSV/workout export, power-to-weight ratio, rider classification, race simulation, and GPX coordinate parsing.
 
 ## License
 
