@@ -142,6 +142,33 @@ def _format_time(seconds: float) -> str:
     return f"{m}:{s:02d}"
 
 
+def _convert_speed(speed_kmh: float, imperial: bool) -> float:
+    """Convert speed from km/h to mph if imperial."""
+    return speed_kmh * 0.621371 if imperial else speed_kmh
+
+
+def _speed_unit(imperial: bool) -> str:
+    return "mph" if imperial else "km/h"
+
+
+def _dist_unit(imperial: bool) -> str:
+    return "mi" if imperial else "km"
+
+
+def _convert_dist_km(dist_km: float, imperial: bool) -> float:
+    """Convert distance from km to miles if imperial."""
+    return dist_km * 0.621371 if imperial else dist_km
+
+
+def _elev_unit(imperial: bool) -> str:
+    return "ft" if imperial else "m"
+
+
+def _convert_elev(elev_m: float, imperial: bool) -> float:
+    """Convert elevation from meters to feet if imperial."""
+    return elev_m * 3.28084 if imperial else elev_m
+
+
 # ---------------------------------------------------------------------------
 # Main application
 # ---------------------------------------------------------------------------
@@ -811,12 +838,20 @@ class BikeSimApp(tk.Tk):
 
         mins = int(result.total_time_s // 60)
         secs = int(result.total_time_s % 60)
+        imp = self._imperial
+        su = _speed_unit(imp)
+        du = _dist_unit(imp)
+        eu = _elev_unit(imp)
+        dist_val = _convert_dist_km(result.total_distance_m / 1000, imp)
+        avg_spd = _convert_speed(result.avg_speed_kmh, imp)
+        elev_gain = _convert_elev(result.total_elevation_gain_m, imp)
+        elev_loss = _convert_elev(result.total_elevation_loss_m, imp)
         summary = (
-            f"Total: {result.total_distance_m / 1000:.2f} km  \u2502  "
+            f"Total: {dist_val:.2f} {du}  \u2502  "
             f"Time: {mins}:{secs:02d}\n"
-            f"Avg Speed: {result.avg_speed_kmh:.1f} km/h\n"
-            f"Elev Gain: {result.total_elevation_gain_m:.0f} m  \u2502  "
-            f"Loss: {result.total_elevation_loss_m:.0f} m\n"
+            f"Avg Speed: {avg_spd:.1f} {su}\n"
+            f"Elev Gain: {elev_gain:.0f} {eu}  \u2502  "
+            f"Loss: {elev_loss:.0f} {eu}\n"
             f"Est. Calories: {total_cal:.0f} kcal"
         )
         self.lbl_course_summary.configure(text=summary)
@@ -824,20 +859,28 @@ class BikeSimApp(tk.Tk):
 
     def _update_course_charts(self, result: Any) -> None:
         t = self._theme
-        distances_km = [d / 1000 for d in result.distances_cumulative]
+        imp = self._imperial
+        su = _speed_unit(imp)
+        du = _dist_unit(imp)
+        eu = _elev_unit(imp)
+
+        distances_km = [_convert_dist_km(d / 1000, imp) for d in result.distances_cumulative]
+        speeds = [_convert_speed(s, imp) for s in result.speeds]
+        avg_speed = _convert_speed(result.avg_speed_kmh, imp)
+        elevations = [_convert_elev(e, imp) for e in result.elevations]
 
         ax1 = self.ax_course_speed
         ax1.clear()
         _style_ax(ax1, t)
         mid_distances = [(distances_km[i] + distances_km[i + 1]) / 2
-                         for i in range(len(result.speeds))]
-        ax1.bar(mid_distances, result.speeds, width=[
-            distances_km[i + 1] - distances_km[i] for i in range(len(result.speeds))
+                         for i in range(len(speeds))]
+        ax1.bar(mid_distances, speeds, width=[
+            distances_km[i + 1] - distances_km[i] for i in range(len(speeds))
         ], color=t["ACCENT"], alpha=0.8, edgecolor=t["BORDER"], linewidth=0.5)
-        ax1.axhline(result.avg_speed_kmh, color=t["ACCENT4"], linestyle="--",
-                    linewidth=1, label=f"Avg: {result.avg_speed_kmh:.1f} km/h")
-        ax1.set_xlabel("Distance (km)", color=t["FG"], fontsize=9)
-        ax1.set_ylabel("Speed (km/h)", color=t["FG"], fontsize=9)
+        ax1.axhline(avg_speed, color=t["ACCENT4"], linestyle="--",
+                    linewidth=1, label=f"Avg: {avg_speed:.1f} {su}")
+        ax1.set_xlabel(f"Distance ({du})", color=t["FG"], fontsize=9)
+        ax1.set_ylabel(f"Speed ({su})", color=t["FG"], fontsize=9)
         ax1.set_title("Speed by Segment", color=t["FG"], fontsize=11, fontweight="bold")
         ax1.legend(fontsize=8, facecolor=t["BG_LIGHT"], edgecolor=t["BORDER"],
                    labelcolor=t["FG"])
@@ -845,10 +888,10 @@ class BikeSimApp(tk.Tk):
         ax2 = self.ax_course_elev
         ax2.clear()
         _style_ax(ax2, t)
-        ax2.fill_between(distances_km, result.elevations, alpha=0.3, color=t["ACCENT2"])
-        ax2.plot(distances_km, result.elevations, color=t["ACCENT2"], linewidth=2)
-        ax2.set_xlabel("Distance (km)", color=t["FG"], fontsize=9)
-        ax2.set_ylabel("Elevation (m)", color=t["FG"], fontsize=9)
+        ax2.fill_between(distances_km, elevations, alpha=0.3, color=t["ACCENT2"])
+        ax2.plot(distances_km, elevations, color=t["ACCENT2"], linewidth=2)
+        ax2.set_xlabel(f"Distance ({du})", color=t["FG"], fontsize=9)
+        ax2.set_ylabel(f"Elevation ({eu})", color=t["FG"], fontsize=9)
         ax2.set_title("Elevation Profile", color=t["FG"], fontsize=11, fontweight="bold")
 
         self.canvas_course.draw_idle()
@@ -971,10 +1014,15 @@ class BikeSimApp(tk.Tk):
 
         mins = int(result.total_time_s // 60)
         secs = int(result.total_time_s % 60)
+        imp = self._imperial
+        su = _speed_unit(imp)
+        du = _dist_unit(imp)
+        dist_val = _convert_dist_km(result.total_distance_m / 1000, imp)
+        avg_spd = _convert_speed(result.avg_speed_kmh, imp)
         summary = (
             f"Total Time: {mins}:{secs:02d}\n"
-            f"Distance: {result.total_distance_m / 1000:.2f} km\n"
-            f"Avg Speed: {result.avg_speed_kmh:.1f} km/h\n"
+            f"Distance: {dist_val:.2f} {du}\n"
+            f"Avg Speed: {avg_spd:.1f} {su}\n"
             f"Avg Power: {result.avg_power_watts:.0f} W\n"
             f"Work: {result.total_work_kj:.0f} kJ\n"
             f"Calories: {result.total_calories_kcal:.0f} kcal"
@@ -984,9 +1032,11 @@ class BikeSimApp(tk.Tk):
 
     def _update_workout_charts(self, result: Any) -> None:
         t = self._theme
+        imp = self._imperial
+        su = _speed_unit(imp)
         times_min = [pt.time_s / 60.0 for pt in result.points]
         powers = [pt.power_watts for pt in result.points]
-        speeds = [pt.speed_kmh for pt in result.points]
+        speeds = [_convert_speed(pt.speed_kmh, imp) for pt in result.points]
 
         ftp = self.var_ftp.get()
         zones = power_zones(ftp)
@@ -1018,7 +1068,7 @@ class BikeSimApp(tk.Tk):
         ax2.plot(times_min, speeds, color=t["ACCENT"], linewidth=1.5)
         ax2.fill_between(times_min, speeds, alpha=0.2, color=t["ACCENT"])
         ax2.set_xlabel("Time (min)", color=t["FG"], fontsize=9)
-        ax2.set_ylabel("Speed (km/h)", color=t["FG"], fontsize=9)
+        ax2.set_ylabel(f"Speed ({su})", color=t["FG"], fontsize=9)
         ax2.set_title("Speed Over Time", color=t["FG"], fontsize=11, fontweight="bold")
 
         self.canvas_workout.draw_idle()
@@ -1062,10 +1112,11 @@ class BikeSimApp(tk.Tk):
         name = f"Scenario {len(self._scenarios) + 1}"
         self._scenarios.append((name, rider, bike, course, result))
 
+        speed_val = _convert_speed(result.speed_kmh, self._imperial)
         self._compare_tree.insert("", tk.END, values=(
             f"{rider.power_watts:.0f}", f"{rider.weight_kg:.1f}",
             f"{course.grade_pct:.1f}", f"{course.headwind_kmh:.0f}",
-            f"{result.speed_kmh:.1f}",
+            f"{speed_val:.1f}",
         ))
         self._update_compare_chart()
 
@@ -1076,15 +1127,31 @@ class BikeSimApp(tk.Tk):
         self.ax_compare.clear()
         self.canvas_compare.draw_idle()
 
+    def _refresh_compare_tree(self) -> None:
+        """Re-populate the compare treeview with current units."""
+        su = _speed_unit(self._imperial)
+        self._compare_tree.heading("speed", text=f"Speed ({su})")
+        for item in self._compare_tree.get_children():
+            self._compare_tree.delete(item)
+        for name, rider, bike, course, result in self._scenarios:
+            speed_val = _convert_speed(result.speed_kmh, self._imperial)
+            self._compare_tree.insert("", tk.END, values=(
+                f"{rider.power_watts:.0f}", f"{rider.weight_kg:.1f}",
+                f"{course.grade_pct:.1f}", f"{course.headwind_kmh:.0f}",
+                f"{speed_val:.1f}",
+            ))
+
     def _update_compare_chart(self) -> None:
         t = self._theme
+        imp = self._imperial
+        su = _speed_unit(imp)
         ax = self.ax_compare
         ax.clear()
         _style_ax(ax, t)
 
         chart_colors = [t[k] for k in CHART_COLOURS_KEYS]
         names = [s[0] for s in self._scenarios]
-        speeds = [s[4].speed_kmh for s in self._scenarios]
+        speeds = [_convert_speed(s[4].speed_kmh, imp) for s in self._scenarios]
         colors = [chart_colors[i % len(chart_colors)] for i in range(len(names))]
 
         bars = ax.bar(names, speeds, color=colors, edgecolor=t["BORDER"],
@@ -1093,7 +1160,7 @@ class BikeSimApp(tk.Tk):
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
                     f"{spd:.1f}", ha="center", va="bottom", color=t["FG"], fontsize=8)
 
-        ax.set_ylabel("Speed (km/h)", color=t["FG"], fontsize=9)
+        ax.set_ylabel(f"Speed ({su})", color=t["FG"], fontsize=9)
         ax.set_title("Scenario Comparison", color=t["FG"], fontsize=11, fontweight="bold")
 
         self.canvas_compare.draw_idle()
@@ -1368,20 +1435,26 @@ class BikeSimApp(tk.Tk):
 
         race_results = simulate_race(self._race_competitors, segments)
 
+        imp = self._imperial
+        su = _speed_unit(imp)
         result_text = "Race Results:\n"
         for i, r in enumerate(race_results):
             mins = int(r.total_time_s // 60)
             secs = int(r.total_time_s % 60)
             gap = f"+{r.gap_to_leader_s:.1f}s" if r.gap_to_leader_s > 0 else "Leader"
+            avg_spd = _convert_speed(r.avg_speed_kmh, imp)
             result_text += (
                 f"  {i+1}. {r.name}: {mins}:{secs:02d} "
-                f"({r.avg_speed_kmh:.1f} km/h) {gap}\n"
+                f"({avg_spd:.1f} {su}) {gap}\n"
             )
         self.lbl_race_results.configure(text=result_text.strip())
         self._update_race_charts(race_results, segments)
 
     def _update_race_charts(self, race_results: list, segments: list) -> None:
         t = self._theme
+        imp = self._imperial
+        su = _speed_unit(imp)
+        du = _dist_unit(imp)
         chart_colors = [t[k] for k in CHART_COLOURS_KEYS]
 
         ax1 = self.ax_race_speed
@@ -1394,13 +1467,14 @@ class BikeSimApp(tk.Tk):
             mid_d = []
             cum = 0.0
             for j, seg in enumerate(segments):
-                mid_d.append((cum + seg.distance_m / 2) / 1000)
+                mid_d.append(_convert_dist_km((cum + seg.distance_m / 2) / 1000, imp))
                 cum += seg.distance_m
-            ax1.plot(mid_d, r.segment_speeds, color=color, linewidth=1.5,
+            seg_speeds = [_convert_speed(s, imp) for s in r.segment_speeds]
+            ax1.plot(mid_d, seg_speeds, color=color, linewidth=1.5,
                      marker="o", markersize=4, label=r.name)
 
-        ax1.set_xlabel("Distance (km)", color=t["FG"], fontsize=9)
-        ax1.set_ylabel("Speed (km/h)", color=t["FG"], fontsize=9)
+        ax1.set_xlabel(f"Distance ({du})", color=t["FG"], fontsize=9)
+        ax1.set_ylabel(f"Speed ({su})", color=t["FG"], fontsize=9)
         ax1.set_title("Speed by Segment", color=t["FG"], fontsize=11,
                       fontweight="bold")
         ax1.legend(fontsize=7, facecolor=t["BG_LIGHT"], edgecolor=t["BORDER"],
@@ -1466,9 +1540,14 @@ class BikeSimApp(tk.Tk):
 
         result = self._last_course_result
         t = self._theme
+        imp = self._imperial
+        du = _dist_unit(imp)
+        eu = _elev_unit(imp)
 
-        distances_km = [d / 1000 for d in result.distances_cumulative]
-        elevations = result.elevations
+        raw_distances_km = [d / 1000 for d in result.distances_cumulative]
+        raw_elevations = result.elevations
+        distances_disp = [_convert_dist_km(d, imp) for d in raw_distances_km]
+        elevations_disp = [_convert_elev(e, imp) for e in raw_elevations]
 
         ax = self.ax_3d
         ax.clear()
@@ -1478,16 +1557,16 @@ class BikeSimApp(tk.Tk):
         ax.yaxis.pane.fill = False
         ax.zaxis.pane.fill = False
 
-        n = len(distances_km)
-        x = distances_km
+        n = len(distances_disp)
+        x = distances_disp
         y = [0.0] * n
-        z = elevations
+        z = elevations_disp
 
         for i in range(n - 1):
             grade = 0.0
-            dist_m = (x[i + 1] - x[i]) * 1000
+            dist_m = (raw_distances_km[i + 1] - raw_distances_km[i]) * 1000
             if dist_m > 0:
-                grade = (z[i + 1] - z[i]) / dist_m * 100
+                grade = (raw_elevations[i + 1] - raw_elevations[i]) / dist_m * 100
 
             if grade > 5:
                 color = "#f38ba8"
@@ -1512,9 +1591,9 @@ class BikeSimApp(tk.Tk):
         ax.plot(x, [0] * n, [min(z)] * n, linestyle=":", linewidth=0.5,
                     color=t["ACCENT2"], alpha=0.15)
 
-        ax.set_xlabel("Distance (km)", color=t["FG"], fontsize=8, labelpad=8)
+        ax.set_xlabel(f"Distance ({du})", color=t["FG"], fontsize=8, labelpad=8)
         ax.set_ylabel("", color=t["FG"], fontsize=8)
-        ax.set_zlabel("Elevation (m)", color=t["FG"], fontsize=8, labelpad=8)
+        ax.set_zlabel(f"Elevation ({eu})", color=t["FG"], fontsize=8, labelpad=8)
         ax.set_title("3D Course Profile", color=t["FG"], fontsize=11,
                      fontweight="bold")
         ax.tick_params(colors=t["FG"], labelsize=7)
@@ -1532,9 +1611,12 @@ class BikeSimApp(tk.Tk):
 
         result = self._last_course_result
         t = self._theme
+        imp = self._imperial
+        du = _dist_unit(imp)
+        eu = _elev_unit(imp)
 
-        distances_km = [d / 1000 for d in result.distances_cumulative]
-        elevations = result.elevations
+        distances_km = [_convert_dist_km(d / 1000, imp) for d in result.distances_cumulative]
+        elevations = [_convert_elev(e, imp) for e in result.elevations]
 
         ax = self.ax_3d
         ax.clear()
@@ -1586,9 +1668,9 @@ class BikeSimApp(tk.Tk):
             ax.scatter([x[-1]], [0], [z[-1]], color=t["ACCENT4"], s=100,
                        marker="s", zorder=10, label="Finish")
 
-        ax.set_xlabel("Distance (km)", color=t["FG"], fontsize=8, labelpad=8)
+        ax.set_xlabel(f"Distance ({du})", color=t["FG"], fontsize=8, labelpad=8)
         ax.set_ylabel("", color=t["FG"], fontsize=8)
-        ax.set_zlabel("Elevation (m)", color=t["FG"], fontsize=8, labelpad=8)
+        ax.set_zlabel(f"Elevation ({eu})", color=t["FG"], fontsize=8, labelpad=8)
         ax.set_title("Elevation Heatmap Overlay", color=t["FG"], fontsize=11,
                      fontweight="bold")
         ax.tick_params(colors=t["FG"], labelsize=7)
@@ -1886,19 +1968,23 @@ class BikeSimApp(tk.Tk):
         even_mins = int(result.even_pace_time_s // 60)
         even_secs = int(result.even_pace_time_s % 60)
 
+        imp = self._imperial
+        su = _speed_unit(imp)
+        avg_spd = _convert_speed(result.avg_speed_kmh, imp)
         text = (
             f"Optimized Time: {mins}:{secs:02d}\n"
             f"Even-Pace Time: {even_mins}:{even_secs:02d}\n"
             f"Time Saved: {result.time_saved_s:.1f}s\n"
             f"Avg Power: {result.avg_power:.0f} W\n"
-            f"Avg Speed: {result.avg_speed_kmh:.1f} km/h\n\n"
+            f"Avg Speed: {avg_spd:.1f} {su}\n\n"
             f"Segment Strategy:\n"
         )
         for ps in result.segments:
+            seg_spd = _convert_speed(ps.speed_kmh, imp)
             text += (
                 f"  Seg {ps.segment_index+1}: {ps.grade_pct:+.1f}% "
                 f"\u2192 {ps.optimal_power:.0f}W "
-                f"({ps.speed_kmh:.1f} km/h) "
+                f"({seg_spd:.1f} {su}) "
                 f"[{ps.strategy_note}]\n"
             )
 
@@ -1907,6 +1993,8 @@ class BikeSimApp(tk.Tk):
 
     def _update_pacing_charts(self, result: Any) -> None:
         t = self._theme
+        imp = self._imperial
+        su = _speed_unit(imp)
 
         ax1 = self.ax_pacing_power
         ax1.clear()
@@ -1950,17 +2038,18 @@ class BikeSimApp(tk.Tk):
         ax2.clear()
         _style_ax(ax2, t)
 
-        speeds = [ps.speed_kmh for ps in result.segments]
+        avg_spd = _convert_speed(result.avg_speed_kmh, imp)
+        speeds = [_convert_speed(ps.speed_kmh, imp) for ps in result.segments]
         ax2.bar(seg_indices, speeds, color=t["ACCENT"], edgecolor=t["BORDER"],
                 alpha=0.85)
-        ax2.axhline(result.avg_speed_kmh, color=t["ACCENT4"], linestyle="--",
-                    linewidth=1.5, label=f"Avg: {result.avg_speed_kmh:.1f} km/h")
+        ax2.axhline(avg_spd, color=t["ACCENT4"], linestyle="--",
+                    linewidth=1.5, label=f"Avg: {avg_spd:.1f} {su}")
         for i, (idx, s) in enumerate(zip(seg_indices, speeds)):
             ax2.text(idx, s + 0.5, f"{s:.1f}",
                      ha="center", va="bottom", color=t["FG"], fontsize=7)
 
         ax2.set_xlabel("Segment", color=t["FG"], fontsize=9)
-        ax2.set_ylabel("Speed (km/h)", color=t["FG"], fontsize=9)
+        ax2.set_ylabel(f"Speed ({su})", color=t["FG"], fontsize=9)
         ax2.set_title("Resulting Speed by Segment", color=t["FG"],
                       fontsize=11, fontweight="bold")
         ax2.legend(fontsize=8, facecolor=t["BG_LIGHT"], edgecolor=t["BORDER"],
@@ -2036,8 +2125,8 @@ class BikeSimApp(tk.Tk):
         self._rt_speed_display = ttk.Label(speed_card, text="0.0",
                                             style="RTMetric.TLabel")
         self._rt_speed_display.pack(side=tk.LEFT, padx=8)
-        ttk.Label(speed_card, text="km/h", style="RTLabel.TLabel").pack(
-            side=tk.LEFT, anchor=tk.S, pady=(0, 6))
+        self._rt_speed_unit_lbl = ttk.Label(speed_card, text="km/h", style="RTLabel.TLabel")
+        self._rt_speed_unit_lbl.pack(side=tk.LEFT, anchor=tk.S, pady=(0, 6))
         self._rt_grade_display = ttk.Label(speed_card, text="0.0%",
                                             style="RTGrade.TLabel")
         self._rt_grade_display.pack(side=tk.RIGHT, padx=8)
@@ -2052,7 +2141,7 @@ class BikeSimApp(tk.Tk):
         metric_defs = [
             ("Distance", "0.00 km", 0, 0),
             ("Elapsed", "0:00", 0, 1),
-            ("Avg Speed", "0.0 km/h", 1, 0),
+            ("Avg Speed", "0.0", 1, 0),
             ("Calories", "0 kcal", 1, 1),
             ("Segment", "1 / 1", 2, 0),
             ("Zone", "Z2", 2, 1),
@@ -2141,6 +2230,9 @@ class BikeSimApp(tk.Tk):
     def _rt_draw_base_course(self, segments: list[CourseSegment]) -> None:
         """Draw the full course elevation profile as background."""
         t = self._theme
+        imp = self._imperial
+        du = _dist_unit(imp)
+        eu = _elev_unit(imp)
         ax = self.ax_rt_course
         ax.clear()
         _style_ax(ax, t)
@@ -2148,17 +2240,18 @@ class BikeSimApp(tk.Tk):
         total_dist = sum(s.distance_m for s in segments)
         n_points = max(100, int(total_dist / 10))
         distances = [i * total_dist / n_points for i in range(n_points + 1)]
-        elevations = [compute_elevation_at_distance(segments, d) for d in distances]
-        distances_km = [d / 1000 for d in distances]
+        elevations_raw = [compute_elevation_at_distance(segments, d) for d in distances]
+        distances_disp = [_convert_dist_km(d / 1000, imp) for d in distances]
+        elevations_disp = [_convert_elev(e, imp) for e in elevations_raw]
 
-        ax.fill_between(distances_km, elevations, alpha=0.2, color=t["ACCENT2"])
-        ax.plot(distances_km, elevations, color=t["ACCENT2"], linewidth=1.5, alpha=0.5)
+        ax.fill_between(distances_disp, elevations_disp, alpha=0.2, color=t["ACCENT2"])
+        ax.plot(distances_disp, elevations_disp, color=t["ACCENT2"], linewidth=1.5, alpha=0.5)
 
         # Grade color coding on segments
         cum = 0.0
         for seg in segments:
-            seg_start_km = cum / 1000
-            seg_end_km = (cum + seg.distance_m) / 1000
+            seg_start = _convert_dist_km(cum / 1000, imp)
+            seg_end = _convert_dist_km((cum + seg.distance_m) / 1000, imp)
             if seg.grade_pct > 5:
                 color = t["ACCENT4"]
             elif seg.grade_pct > 2:
@@ -2167,10 +2260,10 @@ class BikeSimApp(tk.Tk):
                 color = t["ACCENT2"]
             else:
                 color = t["ACCENT"]
-            ax.axvspan(seg_start_km, seg_end_km, alpha=0.05, color=color)
+            ax.axvspan(seg_start, seg_end, alpha=0.05, color=color)
             cum += seg.distance_m
 
-        ax.set_ylabel("Elevation (m)", color=t["FG"], fontsize=9)
+        ax.set_ylabel(f"Elevation ({eu})", color=t["FG"], fontsize=9)
         ax.set_title("Course Profile — Live Ride", color=t["FG"],
                      fontsize=11, fontweight="bold")
 
@@ -2235,7 +2328,7 @@ class BikeSimApp(tk.Tk):
         self._rt_wprime_pct.configure(text="100%")
         for name in self._rt_labels:
             defaults = {"Distance": "0.00 km", "Elapsed": "0:00",
-                        "Avg Speed": "0.0 km/h", "Calories": "0 kcal",
+                        "Avg Speed": "0.0", "Calories": "0 kcal",
                         "Segment": "1 / 1", "Zone": "Z2"}
             self._rt_labels[name].configure(text=defaults.get(name, ""))
 
@@ -2281,8 +2374,8 @@ class BikeSimApp(tk.Tk):
             self._rt_start_btn.configure(state="normal")
             messagebox.showinfo("Ride Complete",
                                 f"Finished in {_format_time(state.elapsed_time_s)}\n"
-                                f"Distance: {state.distance_m/1000:.2f} km\n"
-                                f"Avg Speed: {state.avg_speed_kmh:.1f} km/h\n"
+                                f"Distance: {_convert_dist_km(state.distance_m/1000, self._imperial):.2f} {_dist_unit(self._imperial)}\n"
+                                f"Avg Speed: {_convert_speed(state.avg_speed_kmh, self._imperial):.1f} {_speed_unit(self._imperial)}\n"
                                 f"Calories: {state.calories_kcal:.0f} kcal")
             return
 
@@ -2290,9 +2383,14 @@ class BikeSimApp(tk.Tk):
 
     def _rt_update_display(self, state: RealTimeState) -> None:
         t = self._theme
+        imp = self._imperial
+        su = _speed_unit(imp)
+        du = _dist_unit(imp)
 
         # Speed
-        self._rt_speed_display.configure(text=f"{state.current_speed_kmh:.1f}")
+        disp_speed = _convert_speed(state.current_speed_kmh, imp)
+        self._rt_speed_display.configure(text=f"{disp_speed:.1f}")
+        self._rt_speed_unit_lbl.configure(text=su)
 
         # Grade
         grade_text = f"{state.current_grade_pct:+.1f}%"
@@ -2307,12 +2405,14 @@ class BikeSimApp(tk.Tk):
         self._rt_grade_display.configure(text=grade_text, foreground=grade_color)
 
         # Metrics
+        dist_val = _convert_dist_km(state.distance_m / 1000, imp)
         self._rt_labels["Distance"].configure(
-            text=f"{state.distance_m / 1000:.2f} km")
+            text=f"{dist_val:.2f} {du}")
         self._rt_labels["Elapsed"].configure(
             text=_format_time(state.elapsed_time_s))
+        avg_spd = _convert_speed(state.avg_speed_kmh, imp)
         self._rt_labels["Avg Speed"].configure(
-            text=f"{state.avg_speed_kmh:.1f} km/h")
+            text=f"{avg_spd:.1f} {su}")
         self._rt_labels["Calories"].configure(
             text=f"{state.calories_kcal:.0f} kcal")
         n_segs = len(self._rt_segments) if hasattr(self, '_rt_segments') else 1
@@ -2344,12 +2444,15 @@ class BikeSimApp(tk.Tk):
 
     def _rt_update_charts(self, state: RealTimeState) -> None:
         t = self._theme
+        imp = self._imperial
+        su = _speed_unit(imp)
 
         # Course profile with rider dot
         ax1 = self.ax_rt_course
         if hasattr(self, '_rt_dot'):
-            dist_km = state.distance_m / 1000
-            self._rt_dot.set_data([dist_km], [state.current_elevation_m])
+            dist_km = _convert_dist_km(state.distance_m / 1000, imp)
+            elev = _convert_elev(state.current_elevation_m, imp)
+            self._rt_dot.set_data([dist_km], [elev])
 
         # Speed trace
         ax2 = self.ax_rt_speed
@@ -2357,15 +2460,16 @@ class BikeSimApp(tk.Tk):
         _style_ax(ax2, t)
         time_mins = [ts / 60 for ts in self._rt_time_history]
         if time_mins:
-            ax2.plot(time_mins, self._rt_speed_history, color=t["ACCENT"],
+            disp_speeds = [_convert_speed(s, imp) for s in self._rt_speed_history]
+            ax2.plot(time_mins, disp_speeds, color=t["ACCENT"],
                      linewidth=1.5)
-            ax2.fill_between(time_mins, self._rt_speed_history,
+            ax2.fill_between(time_mins, disp_speeds,
                              alpha=0.15, color=t["ACCENT"])
-            if len(self._rt_speed_history) > 1:
-                avg = sum(self._rt_speed_history) / len(self._rt_speed_history)
+            if len(disp_speeds) > 1:
+                avg = sum(disp_speeds) / len(disp_speeds)
                 ax2.axhline(avg, color=t["ACCENT4"], linestyle="--",
                             linewidth=1, alpha=0.7)
-        ax2.set_ylabel("Speed (km/h)", color=t["FG"], fontsize=9)
+        ax2.set_ylabel(f"Speed ({su})", color=t["FG"], fontsize=9)
         ax2.set_title("Live Speed", color=t["FG"], fontsize=10, fontweight="bold")
 
         # Power trace
@@ -2469,6 +2573,10 @@ class BikeSimApp(tk.Tk):
             return
 
         t = self._theme
+        imp = self._imperial
+        su = _speed_unit(imp)
+        du = _dist_unit(imp)
+        eu = _elev_unit(imp)
         rider, bike, course = self._gather_params()
         result = solve_speed(rider, bike, course)
 
@@ -2479,6 +2587,7 @@ class BikeSimApp(tk.Tk):
 
             ax_info = fig1.add_subplot(311)
             ax_info.axis("off")
+            result_spd = _convert_speed(result.speed_kmh, imp)
             info_text = (
                 f"Power: {rider.power_watts:.0f} W  |  "
                 f"Weight: {rider.weight_kg:.1f} kg  |  "
@@ -2488,8 +2597,7 @@ class BikeSimApp(tk.Tk):
                 f"Position: {bike.position.value}\n"
                 f"Grade: {course.grade_pct:.1f}%  |  "
                 f"Wind: {course.headwind_kmh:.0f} km/h\n\n"
-                f"RESULT: {result.speed_kmh:.1f} km/h  "
-                f"({result.speed_mph:.1f} mph)\n"
+                f"RESULT: {result_spd:.1f} {su}\n"
                 f"Aero: {result.power_aero:.1f} W  |  "
                 f"Rolling: {result.power_rolling:.1f} W  |  "
                 f"Gravity: {result.power_gravity:.1f} W"
@@ -2498,12 +2606,13 @@ class BikeSimApp(tk.Tk):
                         fontsize=10, verticalalignment="center", family="monospace")
 
             ax_curve = fig1.add_subplot(312)
-            powers, speeds = speed_vs_power_curve(rider, bike, course)
-            ax_curve.plot(powers, speeds, color="steelblue", linewidth=2)
+            powers, speeds_raw = speed_vs_power_curve(rider, bike, course)
+            speeds_disp = [_convert_speed(s, imp) for s in speeds_raw]
+            ax_curve.plot(powers, speeds_disp, color="steelblue", linewidth=2)
             ax_curve.axvline(rider.power_watts, color="red", linestyle="--", linewidth=1)
-            ax_curve.scatter([rider.power_watts], [result.speed_kmh], color="green", s=60, zorder=5)
+            ax_curve.scatter([rider.power_watts], [result_spd], color="green", s=60, zorder=5)
             ax_curve.set_xlabel("Power (W)")
-            ax_curve.set_ylabel("Speed (km/h)")
+            ax_curve.set_ylabel(f"Speed ({su})")
             ax_curve.set_title("Speed vs Power")
             ax_curve.grid(True, alpha=0.3)
 
@@ -2530,22 +2639,25 @@ class BikeSimApp(tk.Tk):
                 fig2 = Figure(figsize=(11, 8.5), dpi=150, facecolor="white")
                 fig2.suptitle("Course Profile Report", fontsize=16, fontweight="bold")
 
-                dk = [d / 1000 for d in cr.distances_cumulative]
+                dk = [_convert_dist_km(d / 1000, imp) for d in cr.distances_cumulative]
+                cr_speeds = [_convert_speed(s, imp) for s in cr.speeds]
+                cr_avg = _convert_speed(cr.avg_speed_kmh, imp)
                 ax_s = fig2.add_subplot(211)
-                mid_d = [(dk[i] + dk[i + 1]) / 2 for i in range(len(cr.speeds))]
-                ax_s.bar(mid_d, cr.speeds, width=[dk[i + 1] - dk[i] for i in range(len(cr.speeds))],
+                mid_d = [(dk[i] + dk[i + 1]) / 2 for i in range(len(cr_speeds))]
+                ax_s.bar(mid_d, cr_speeds, width=[dk[i + 1] - dk[i] for i in range(len(cr_speeds))],
                          color="steelblue", alpha=0.8)
-                ax_s.axhline(cr.avg_speed_kmh, color="red", linestyle="--")
-                ax_s.set_xlabel("Distance (km)")
-                ax_s.set_ylabel("Speed (km/h)")
+                ax_s.axhline(cr_avg, color="red", linestyle="--")
+                ax_s.set_xlabel(f"Distance ({du})")
+                ax_s.set_ylabel(f"Speed ({su})")
                 ax_s.set_title("Speed by Segment")
                 ax_s.grid(True, alpha=0.3)
 
+                cr_elevations = [_convert_elev(e, imp) for e in cr.elevations]
                 ax_e = fig2.add_subplot(212)
-                ax_e.fill_between(dk, cr.elevations, alpha=0.3, color="green")
-                ax_e.plot(dk, cr.elevations, color="green", linewidth=2)
-                ax_e.set_xlabel("Distance (km)")
-                ax_e.set_ylabel("Elevation (m)")
+                ax_e.fill_between(dk, cr_elevations, alpha=0.3, color="green")
+                ax_e.plot(dk, cr_elevations, color="green", linewidth=2)
+                ax_e.set_xlabel(f"Distance ({du})")
+                ax_e.set_ylabel(f"Elevation ({eu})")
                 ax_e.set_title("Elevation Profile")
                 ax_e.grid(True, alpha=0.3)
 
@@ -2637,6 +2749,14 @@ class BikeSimApp(tk.Tk):
             self.lbl_speed_unit1.configure(text="km/h")
             self.lbl_speed_unit2.configure(text="mph")
         self._run_simulation()
+        # Re-render other tabs that have cached data
+        if self._last_course_result:
+            self._run_course_profile()
+        if hasattr(self, '_last_workout_result'):
+            self._run_workout()
+        if self._scenarios:
+            self._refresh_compare_tree()
+            self._update_compare_chart()
 
     # ------------------------------------------------------------------
     # Presets
