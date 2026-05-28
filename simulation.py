@@ -1538,3 +1538,437 @@ def compute_realtime_tick(
         power_zone_color=zone_color,
         is_finished=is_finished,
     )
+
+
+# ---------------------------------------------------------------------------
+# GPX ride analysis — predicted vs actual speed
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GPXRidePoint:
+    """A point from a parsed GPX ride with time, position, and optional power."""
+    time_s: float
+    distance_m: float
+    elevation_m: float
+    speed_kmh: float
+    grade_pct: float
+    lat: float
+    lon: float
+    power_watts: float | None = None
+
+
+@dataclass
+class RideAnalysis:
+    """Result of comparing predicted vs actual ride data."""
+    points: list[GPXRidePoint]
+    predicted_speeds: list[float]
+    actual_speeds: list[float]
+    distances_km: list[float]
+    elevations: list[float]
+    grades: list[float]
+    mean_error_kmh: float
+    rmse_kmh: float
+    mean_pct_error: float
+    total_distance_m: float
+    total_time_s: float
+    actual_avg_speed_kmh: float
+    predicted_avg_speed_kmh: float
+
+
+def parse_gpx_ride(filepath: str | Path) -> list[GPXRidePoint]:
+    """Parse a GPX file with time data into ride points.
+
+    Extracts timestamps, computes speed between points, and optionally
+    reads power data from Garmin TrackPointExtension.
+    """
+    tree = ET.parse(filepath)
+    root = tree.getroot()
+
+    ns = ""
+    if root.tag.startswith("{"):
+        ns = root.tag.split("}")[0] + "}"
+
+    trackpoints: list[tuple[float, float, float, str | None, float | None]] = []
+    for trkpt in root.iter(f"{ns}trkpt"):
+        lat = float(trkpt.attrib["lat"])
+        lon = float(trkpt.attrib["lon"])
+        ele_elem = trkpt.find(f"{ns}ele")
+        ele = float(ele_elem.text) if ele_elem is not None else 0.0
+
+        time_elem = trkpt.find(f"{ns}time")
+        time_str = time_elem.text if time_elem is not None else None
+
+        # Try to find power in extensions
+        power_val: float | None = None
+        extensions = trkpt.find(f"{ns}extensions")
+        if extensions is not None:
+            # Garmin TrackPointExtension
+            for child in extensions:
+                tag_lower = child.tag.lower()
+                if "power" in tag_lower:
+                    try:
+                        power_val = float(child.text)
+                    except (TypeError, ValueError):
+                        pass
+                # Also check nested extension elements
+                for sub in child:
+                    sub_tag = sub.tag.lower()
+                    if "power" in sub_tag or "watts" in sub_tag:
+                        try:
+                            power_val = float(sub.text)
+                        except (TypeError, ValueError):
+                            pass
+
+        trackpoints.append((lat, lon, ele, time_str, power_val))
+
+    if len(trackpoints) < 2:
+        return []
+
+    # Parse timestamps
+    import re
+    def _parse_iso(s: str | None) -> float | None:
+        if not s:
+            return None
+        s = s.strip()
+        s = re.sub(r'\.\d+', '', s)
+        try:
+            import datetime
+            dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+            return dt.timestamp()
+        except (ValueError, TypeError):
+            return None
+
+    base_ts = _parse_iso(trackpoints[0][3])
+    if base_ts is None:
+        return []
+
+    points: list[GPXRidePoint] = []
+    cum_dist = 0.0
+
+    for i in range(len(trackpoints)):
+        ts = _parse_iso(trackpoints[i][3])
+        if ts is None:
+            continue
+        time_s = ts - base_ts
+
+        if i == 0:
+            speed = 0.0
+            grade = 0.0
+        else:
+            dist = _haversine(
+                trackpoints[i - 1][0], trackpoints[i - 1][1],
+                trackpoints[i][0], trackpoints[i][1],
+            )
+            dt = time_s - ((_parse_iso(trackpoints[i - 1][3]) or base_ts) - base_ts)
+            cum_dist += dist
+            speed = (dist / dt * 3.6) if dt > 0 else 0.0
+            grade = (trackpoints[i][2] - trackpoints[i - 1][2]) / dist * 100.0 if dist > 0 else 0.0
+
+        points.append(GPXRidePoint(
+            time_s=time_s,
+            distance_m=cum_dist,
+            elevation_m=trackpoints[i][2],
+            speed_kmh=min(speed, 120.0),  # Cap unrealistic speeds
+            grade_pct=max(-30, min(30, grade)),
+            lat=trackpoints[i][0],
+            lon=trackpoints[i][1],
+            power_watts=trackpoints[i][4],
+        ))
+
+    return points
+
+
+def analyze_ride(
+    points: list[GPXRidePoint],
+    rider: RiderParams,
+    bike: BikeParams,
+    smoothing_window: int = 5,
+) -> RideAnalysis:
+    """Compare actual ride data against model predictions.
+
+    For each point, predicts speed using the simulation model at the
+    point's grade and elevation, then computes error metrics.
+    """
+    if len(points) < 2:
+        raise ValueError("Need at least 2 ride points for analysis")
+
+    # Smooth grade data to reduce GPS noise
+    grades = [p.grade_pct for p in points]
+    smoothed_grades: list[float] = []
+    for i in range(len(grades)):
+        lo = max(0, i - smoothing_window // 2)
+        hi = min(len(grades), i + smoothing_window // 2 + 1)
+        smoothed_grades.append(sum(grades[lo:hi]) / (hi - lo))
+
+    actual_speeds: list[float] = []
+    predicted_speeds: list[float] = []
+    distances_km: list[float] = []
+    elevations: list[float] = []
+
+    for i, pt in enumerate(points):
+        if pt.speed_kmh < 1.0:
+            continue  # Skip stopped points
+
+        power = pt.power_watts if pt.power_watts is not None else rider.power_watts
+        course = CourseParams(
+            grade_pct=smoothed_grades[i],
+            elevation_m=pt.elevation_m,
+        )
+        rider_copy = RiderParams(
+            power_watts=power,
+            weight_kg=rider.weight_kg,
+            height_cm=rider.height_cm,
+        )
+        pred = solve_speed(rider_copy, bike, course)
+
+        actual_speeds.append(pt.speed_kmh)
+        predicted_speeds.append(pred.speed_kmh)
+        distances_km.append(pt.distance_m / 1000.0)
+        elevations.append(pt.elevation_m)
+
+    if not actual_speeds:
+        raise ValueError("No valid data points found in ride")
+
+    # Error metrics
+    errors = [p - a for p, a in zip(predicted_speeds, actual_speeds)]
+    mean_error = sum(errors) / len(errors)
+    rmse = math.sqrt(sum(e ** 2 for e in errors) / len(errors))
+    pct_errors = [abs(p - a) / max(a, 1.0) * 100.0
+                  for p, a in zip(predicted_speeds, actual_speeds)]
+    mean_pct = sum(pct_errors) / len(pct_errors)
+
+    total_dist = points[-1].distance_m
+    total_time = points[-1].time_s
+    actual_avg = total_dist / total_time * 3.6 if total_time > 0 else 0.0
+    pred_avg = sum(predicted_speeds) / len(predicted_speeds) if predicted_speeds else 0.0
+
+    return RideAnalysis(
+        points=points,
+        predicted_speeds=predicted_speeds,
+        actual_speeds=actual_speeds,
+        distances_km=distances_km,
+        elevations=elevations,
+        grades=smoothed_grades[:len(distances_km)],
+        mean_error_kmh=mean_error,
+        rmse_kmh=rmse,
+        mean_pct_error=mean_pct,
+        total_distance_m=total_dist,
+        total_time_s=total_time,
+        actual_avg_speed_kmh=actual_avg,
+        predicted_avg_speed_kmh=pred_avg,
+    )
+
+
+# ---------------------------------------------------------------------------
+# What-if scenario analysis
+# ---------------------------------------------------------------------------
+
+@dataclass
+class WhatIfChange:
+    """A single parameter change for what-if analysis."""
+    parameter: str  # e.g. "weight_kg", "power_watts", "position", "tire_type"
+    label: str
+    original_value: Any
+    new_value: Any
+
+
+@dataclass
+class WhatIfResult:
+    """Result of a what-if scenario on a course."""
+    change: WhatIfChange
+    original_time_s: float
+    new_time_s: float
+    time_diff_s: float
+    original_avg_speed_kmh: float
+    new_avg_speed_kmh: float
+    speed_diff_kmh: float
+    pct_improvement: float
+
+
+def what_if_analysis(
+    rider: RiderParams,
+    bike: BikeParams,
+    segments: list[CourseSegment],
+    changes: list[WhatIfChange],
+) -> list[WhatIfResult]:
+    """Evaluate time impact of each parameter change on a course."""
+    base_result = simulate_course_profile(rider, bike, segments)
+    base_time = base_result.total_time_s
+    base_speed = base_result.avg_speed_kmh
+
+    results: list[WhatIfResult] = []
+
+    for change in changes:
+        test_rider = RiderParams(
+            power_watts=rider.power_watts,
+            weight_kg=rider.weight_kg,
+            height_cm=rider.height_cm,
+        )
+        test_bike = BikeParams(
+            weight_kg=bike.weight_kg,
+            tire_type=bike.tire_type,
+            position=bike.position,
+            drivetrain_efficiency=bike.drivetrain_efficiency,
+            wheel_mass_kg=bike.wheel_mass_kg,
+            wheel_radius_m=bike.wheel_radius_m,
+        )
+
+        param = change.parameter
+        val = change.new_value
+
+        if param == "weight_kg":
+            test_rider.weight_kg = float(val)
+        elif param == "power_watts":
+            test_rider.power_watts = float(val)
+        elif param == "height_cm":
+            test_rider.height_cm = float(val)
+        elif param == "bike_weight_kg":
+            test_bike.weight_kg = float(val)
+        elif param == "position":
+            test_bike.position = val
+        elif param == "tire_type":
+            test_bike.tire_type = val
+        elif param == "drivetrain_efficiency":
+            test_bike.drivetrain_efficiency = float(val)
+
+        new_result = simulate_course_profile(test_rider, test_bike, segments)
+        new_time = new_result.total_time_s
+        new_speed = new_result.avg_speed_kmh
+        time_diff = base_time - new_time  # positive = faster
+        speed_diff = new_speed - base_speed  # positive = faster
+        pct = (time_diff / base_time * 100.0) if base_time > 0 else 0.0
+
+        results.append(WhatIfResult(
+            change=change,
+            original_time_s=base_time,
+            new_time_s=new_time,
+            time_diff_s=time_diff,
+            original_avg_speed_kmh=base_speed,
+            new_avg_speed_kmh=new_speed,
+            speed_diff_kmh=speed_diff,
+            pct_improvement=pct,
+        ))
+
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Segment KOM predictor
+# ---------------------------------------------------------------------------
+
+# W/kg benchmarks for KOM categories at different gradients
+# Format: (category_name, w_kg_flat, w_kg_5pct, w_kg_8pct)
+KOM_BENCHMARKS: list[tuple[str, float, float, float]] = [
+    ("World Tour Pro", 6.2, 6.5, 6.8),
+    ("Domestic Pro", 5.5, 5.8, 6.0),
+    ("Cat 1", 5.0, 5.2, 5.4),
+    ("Cat 2", 4.3, 4.5, 4.7),
+    ("Cat 3", 3.7, 3.9, 4.1),
+    ("Cat 4", 3.0, 3.2, 3.4),
+    ("Cat 5", 2.3, 2.5, 2.7),
+    ("Beginner", 1.5, 1.7, 1.9),
+]
+
+
+@dataclass
+class SegmentKOMResult:
+    """KOM prediction for a single segment."""
+    segment_index: int
+    distance_m: float
+    grade_pct: float
+    elevation_gain_m: float
+    rider_time_s: float
+    rider_speed_kmh: float
+    rider_power_watts: float
+    rider_w_kg: float
+    category_times: list[tuple[str, float, float]]  # (name, time_s, speed_kmh)
+    rider_rank: str  # Which category bracket the rider falls into
+
+
+@dataclass
+class KOMPrediction:
+    """Full KOM prediction result for a course."""
+    segments: list[SegmentKOMResult]
+    total_rider_time_s: float
+    total_category_times: list[tuple[str, float]]  # (name, total_time_s)
+
+
+def predict_kom(
+    rider: RiderParams,
+    bike: BikeParams,
+    segments: list[CourseSegment],
+) -> KOMPrediction:
+    """Predict segment times and compare against category benchmarks."""
+    rider_weight = rider.weight_kg + bike.weight_kg
+    rider_w_kg = rider.power_watts / rider.weight_kg if rider.weight_kg > 0 else 0
+
+    segment_results: list[SegmentKOMResult] = []
+    total_rider_time = 0.0
+    cat_total_times: dict[str, float] = {cat[0]: 0.0 for cat in KOM_BENCHMARKS}
+
+    for i, seg in enumerate(segments):
+        # Rider's time
+        course = CourseParams(
+            grade_pct=seg.grade_pct,
+            headwind_kmh=seg.headwind_kmh,
+            wind_direction_deg=seg.wind_direction_deg,
+            elevation_m=seg.elevation_m,
+            temperature_c=seg.temperature_c,
+        )
+        rider_result = solve_speed(rider, bike, course)
+        rider_time = seg.distance_m / max(rider_result.speed_ms, 0.1)
+        total_rider_time += rider_time
+
+        elev_gain = max(0, seg.distance_m * math.sin(grade_to_radians(seg.grade_pct)))
+
+        # Interpolate W/kg benchmark based on segment grade
+        def _interp_wkg(flat: float, mid: float, steep: float, grade: float) -> float:
+            abs_g = abs(grade)
+            if abs_g <= 0:
+                return flat
+            elif abs_g <= 5:
+                return flat + (mid - flat) * (abs_g / 5.0)
+            elif abs_g <= 8:
+                return mid + (steep - mid) * ((abs_g - 5.0) / 3.0)
+            else:
+                return steep
+
+        # Category times
+        cat_times: list[tuple[str, float, float]] = []
+        for cat_name, wkg_flat, wkg_5, wkg_8 in KOM_BENCHMARKS:
+            cat_wkg = _interp_wkg(wkg_flat, wkg_5, wkg_8, seg.grade_pct)
+            cat_power = cat_wkg * 75.0  # Reference weight
+            cat_rider = RiderParams(power_watts=cat_power, weight_kg=75.0, height_cm=178.0)
+            cat_result = solve_speed(cat_rider, bike, course)
+            cat_time = seg.distance_m / max(cat_result.speed_ms, 0.1)
+            cat_speed = cat_result.speed_kmh
+            cat_times.append((cat_name, cat_time, cat_speed))
+            cat_total_times[cat_name] += cat_time
+
+        # Determine rider's category rank
+        rank = "Beginner"
+        for cat_name, cat_time, _ in cat_times:
+            if rider_time <= cat_time:
+                rank = cat_name
+                break
+
+        segment_results.append(SegmentKOMResult(
+            segment_index=i,
+            distance_m=seg.distance_m,
+            grade_pct=seg.grade_pct,
+            elevation_gain_m=elev_gain,
+            rider_time_s=rider_time,
+            rider_speed_kmh=rider_result.speed_kmh,
+            rider_power_watts=rider.power_watts,
+            rider_w_kg=rider_w_kg,
+            category_times=cat_times,
+            rider_rank=rank,
+        ))
+
+    total_cat = [(name, cat_total_times[name]) for name, _, _, _ in KOM_BENCHMARKS]
+
+    return KOMPrediction(
+        segments=segment_results,
+        total_rider_time_s=total_rider_time,
+        total_category_times=total_cat,
+    )

@@ -25,6 +25,7 @@ from simulation import (
     CourseSegment,
     CriticalPowerModel,
     IntervalStep,
+    KOM_BENCHMARKS,
     PRESETS,
     Preset,
     RaceCompetitor,
@@ -34,8 +35,10 @@ from simulation import (
     RidingPosition,
     SimulationResult,
     TireType,
+    WhatIfChange,
     ZONE_COLORS,
     ZONE_NAMES,
+    analyze_ride,
     classify_rider,
     compute_elevation_at_distance,
     compute_realtime_tick,
@@ -50,9 +53,11 @@ from simulation import (
     load_presets,
     optimize_pacing,
     parse_gpx,
+    parse_gpx_ride,
     parse_gpx_with_coords,
     power_to_weight_ratio,
     power_zones,
+    predict_kom,
     save_presets,
     simulate_course_profile,
     simulate_race,
@@ -61,6 +66,7 @@ from simulation import (
     speed_vs_power_curve,
     validate_all,
     w_per_kg_analysis,
+    what_if_analysis,
     zone_for_power,
     # Unit conversions
     kg_to_lbs, lbs_to_kg,
@@ -397,6 +403,9 @@ class BikeSimApp(tk.Tk):
         self._build_cp_tab()
         self._build_pacing_tab()
         self._build_realtime_tab()
+        self._build_ride_analysis_tab()
+        self._build_whatif_tab()
+        self._build_kom_tab()
         self._build_export_tab()
 
         # Status bar
@@ -2501,7 +2510,572 @@ class BikeSimApp(tk.Tk):
         self.canvas_rt.draw_idle()
 
     # ==================================================================
-    # TAB 11: Export
+    # TAB 11: Ride Analysis
+    # ==================================================================
+    def _build_ride_analysis_tab(self) -> None:
+        tab = ttk.Frame(self._notebook)
+        self._notebook.add(tab, text="  \U0001f4ca Ride Analysis  ")
+
+        paned = ttk.PanedWindow(tab, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+
+        # Left panel — controls
+        left = ttk.Frame(paned)
+        paned.add(left, weight=1)
+
+        ctrl = self._card_frame(left, "GPX Ride Import")
+
+        ttk.Button(ctrl, text="Load GPX Ride File",
+                   command=self._load_ride_gpx).pack(fill=tk.X, padx=8, pady=4)
+
+        ttk.Label(ctrl, text="Power (W) if not in file:",
+                  font=("Helvetica", 9)).pack(anchor=tk.W, padx=8, pady=(8, 0))
+        self.var_ride_power = tk.DoubleVar(value=200)
+        self._add_slider(ctrl, "Ride Power", self.var_ride_power, 50, 500, 5, "W")
+
+        ttk.Label(ctrl, text="Smoothing Window:",
+                  font=("Helvetica", 9)).pack(anchor=tk.W, padx=8, pady=(8, 0))
+        self.var_smoothing = tk.IntVar(value=5)
+        smooth_frame = ttk.Frame(ctrl)
+        smooth_frame.pack(fill=tk.X, padx=8, pady=2)
+        for v in [3, 5, 10, 20]:
+            ttk.Radiobutton(smooth_frame, text=str(v), variable=self.var_smoothing,
+                            value=v).pack(side=tk.LEFT, padx=4)
+
+        ttk.Button(ctrl, text="Re-analyze", style="Secondary.TButton",
+                   command=self._reanalyze_ride).pack(fill=tk.X, padx=8, pady=4)
+
+        # Model accuracy card
+        acc_card = self._card_frame(left, "Model Accuracy")
+        self.lbl_ride_accuracy = ttk.Label(acc_card, text="Load a GPX file to begin",
+                                            font=("Helvetica", 10), wraplength=280,
+                                            justify=tk.LEFT)
+        self.lbl_ride_accuracy.pack(padx=8, pady=8, anchor=tk.W)
+
+        # Ride summary card
+        summ_card = self._card_frame(left, "Ride Summary")
+        self.lbl_ride_summary = ttk.Label(summ_card, text="",
+                                           font=("Helvetica", 10), wraplength=280,
+                                           justify=tk.LEFT)
+        self.lbl_ride_summary.pack(padx=8, pady=8, anchor=tk.W)
+
+        # Right panel — charts
+        right = ttk.Frame(paned)
+        paned.add(right, weight=3)
+
+        t = self._theme
+        self.fig_ride = Figure(figsize=(8, 8), dpi=100, facecolor=t["BG"])
+        self.fig_ride.subplots_adjust(left=0.08, right=0.95, top=0.95, bottom=0.06,
+                                      hspace=0.35)
+        self.ax_ride_speed = self.fig_ride.add_subplot(311)
+        self.ax_ride_elev = self.fig_ride.add_subplot(312)
+        self.ax_ride_error = self.fig_ride.add_subplot(313)
+        self.canvas_ride = FigureCanvasTkAgg(self.fig_ride, master=right)
+        self.canvas_ride.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        self._ride_points: list = []
+        self._ride_analysis = None
+
+    def _load_ride_gpx(self) -> None:
+        path = filedialog.askopenfilename(filetypes=[("GPX files", "*.gpx")])
+        if not path:
+            return
+        try:
+            self._ride_points = parse_gpx_ride(path)
+            if not self._ride_points:
+                messagebox.showwarning("GPX", "No trackpoints with timestamps found.")
+                return
+            self._run_ride_analysis()
+        except Exception as e:
+            messagebox.showerror("GPX Error", str(e))
+
+    def _reanalyze_ride(self) -> None:
+        if not self._ride_points:
+            messagebox.showwarning("No Data", "Load a GPX ride file first.")
+            return
+        self._run_ride_analysis()
+
+    def _run_ride_analysis(self) -> None:
+        rider, bike, _ = self._gather_params()
+        rider.power_watts = self.var_ride_power.get()
+
+        try:
+            analysis = analyze_ride(
+                self._ride_points, rider, bike,
+                smoothing_window=self.var_smoothing.get(),
+            )
+        except ValueError as e:
+            messagebox.showwarning("Analysis Error", str(e))
+            return
+
+        self._ride_analysis = analysis
+        imp = self._imperial
+        su = _speed_unit(imp)
+        du = _dist_unit(imp)
+        eu = _elev_unit(imp)
+
+        # Accuracy metrics
+        mean_err = _convert_speed(abs(analysis.mean_error_kmh), imp)
+        rmse = _convert_speed(analysis.rmse_kmh, imp)
+        acc_text = (
+            f"Mean Error: {mean_err:.1f} {su}\n"
+            f"RMSE: {rmse:.1f} {su}\n"
+            f"Mean % Error: {analysis.mean_pct_error:.1f}%\n\n"
+            f"Predicted Avg: {_convert_speed(analysis.predicted_avg_speed_kmh, imp):.1f} {su}\n"
+            f"Actual Avg: {_convert_speed(analysis.actual_avg_speed_kmh, imp):.1f} {su}"
+        )
+        self.lbl_ride_accuracy.configure(text=acc_text)
+
+        # Ride summary
+        dist_val = _convert_dist_km(analysis.total_distance_m / 1000, imp)
+        mins = int(analysis.total_time_s // 60)
+        secs = int(analysis.total_time_s % 60)
+        elev_range = max(analysis.elevations) - min(analysis.elevations) if analysis.elevations else 0
+        summ_text = (
+            f"Distance: {dist_val:.1f} {du}\n"
+            f"Time: {mins}:{secs:02d}\n"
+            f"Elev Range: {_convert_elev(elev_range, imp):.0f} {eu}\n"
+            f"Points: {len(analysis.actual_speeds)}"
+        )
+        self.lbl_ride_summary.configure(text=summ_text)
+
+        self._update_ride_charts(analysis)
+
+    def _update_ride_charts(self, analysis: Any) -> None:
+        t = self._theme
+        imp = self._imperial
+        su = _speed_unit(imp)
+        du = _dist_unit(imp)
+        eu = _elev_unit(imp)
+
+        distances = [_convert_dist_km(d, imp) for d in analysis.distances_km]
+        actual = [_convert_speed(s, imp) for s in analysis.actual_speeds]
+        predicted = [_convert_speed(s, imp) for s in analysis.predicted_speeds]
+        elevations = [_convert_elev(e, imp) for e in analysis.elevations]
+
+        # Speed comparison
+        ax1 = self.ax_ride_speed
+        ax1.clear()
+        _style_ax(ax1, t)
+        ax1.plot(distances, actual, color=t["ACCENT"], linewidth=1.2,
+                 alpha=0.7, label="Actual")
+        ax1.plot(distances, predicted, color=t["ACCENT4"], linewidth=1.2,
+                 alpha=0.7, label="Predicted")
+        ax1.set_xlabel(f"Distance ({du})", color=t["FG"], fontsize=9)
+        ax1.set_ylabel(f"Speed ({su})", color=t["FG"], fontsize=9)
+        ax1.set_title("Predicted vs Actual Speed", color=t["FG"],
+                      fontsize=11, fontweight="bold")
+        ax1.legend(fontsize=8, facecolor=t["BG_LIGHT"], edgecolor=t["BORDER"],
+                   labelcolor=t["FG"])
+
+        # Elevation profile
+        ax2 = self.ax_ride_elev
+        ax2.clear()
+        _style_ax(ax2, t)
+        ax2.fill_between(distances, elevations, alpha=0.3, color=t["ACCENT2"])
+        ax2.plot(distances, elevations, color=t["ACCENT2"], linewidth=1.5)
+        ax2.set_xlabel(f"Distance ({du})", color=t["FG"], fontsize=9)
+        ax2.set_ylabel(f"Elevation ({eu})", color=t["FG"], fontsize=9)
+        ax2.set_title("Elevation Profile", color=t["FG"], fontsize=11, fontweight="bold")
+
+        # Error distribution
+        ax3 = self.ax_ride_error
+        ax3.clear()
+        _style_ax(ax3, t)
+        errors = [_convert_speed(p - a, imp) for p, a in
+                  zip(analysis.predicted_speeds, analysis.actual_speeds)]
+        ax3.plot(distances, errors, color=t["ACCENT3"], linewidth=1, alpha=0.7)
+        ax3.axhline(0, color=t["FG"], linewidth=0.5, alpha=0.3)
+        ax3.fill_between(distances, errors, alpha=0.15, color=t["ACCENT3"])
+        ax3.set_xlabel(f"Distance ({du})", color=t["FG"], fontsize=9)
+        ax3.set_ylabel(f"Error ({su})", color=t["FG"], fontsize=9)
+        ax3.set_title("Prediction Error (Predicted \u2212 Actual)", color=t["FG"],
+                      fontsize=11, fontweight="bold")
+
+        self.canvas_ride.draw_idle()
+
+    # ==================================================================
+    # TAB 12: What-If Scenarios
+    # ==================================================================
+    def _build_whatif_tab(self) -> None:
+        tab = ttk.Frame(self._notebook)
+        self._notebook.add(tab, text="  \U0001f914 What-If  ")
+
+        paned = ttk.PanedWindow(tab, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+
+        # Left panel — scenario inputs
+        left = ttk.Frame(paned)
+        paned.add(left, weight=1)
+
+        info_card = self._card_frame(left, "What-If Analysis")
+        ttk.Label(info_card,
+                  text="See how changes affect your course time.\n"
+                       "Uses the Course Profile segments.",
+                  font=("Helvetica", 9), wraplength=280,
+                  justify=tk.LEFT).pack(padx=8, pady=4, anchor=tk.W)
+
+        # Weight change
+        wt_card = self._card_frame(left, "Weight Change (kg)")
+        self.var_wi_weight = tk.DoubleVar(value=-2.0)
+        self._add_slider(wt_card, "\u0394 Weight", self.var_wi_weight, -10, 10, 0.5, "kg")
+
+        # Power change
+        pw_card = self._card_frame(left, "Power Change (W)")
+        self.var_wi_power = tk.DoubleVar(value=20.0)
+        self._add_slider(pw_card, "\u0394 Power", self.var_wi_power, -100, 100, 5, "W")
+
+        # Position change
+        pos_card = self._card_frame(left, "Riding Position")
+        self.var_wi_position = tk.StringVar(value="(no change)")
+        positions = ["(no change)"] + [p.value for p in RidingPosition]
+        ttk.OptionMenu(pos_card, self.var_wi_position,
+                       positions[0], *positions).pack(fill=tk.X, padx=8, pady=4)
+
+        # Tire change
+        tire_card = self._card_frame(left, "Tire Type")
+        self.var_wi_tire = tk.StringVar(value="(no change)")
+        tires = ["(no change)"] + [t.value for t in TireType]
+        ttk.OptionMenu(tire_card, self.var_wi_tire,
+                       tires[0], *tires).pack(fill=tk.X, padx=8, pady=4)
+
+        # Bike weight change
+        bw_card = self._card_frame(left, "Bike Weight Change (kg)")
+        self.var_wi_bike_weight = tk.DoubleVar(value=0.0)
+        self._add_slider(bw_card, "\u0394 Bike", self.var_wi_bike_weight, -5, 5, 0.5, "kg")
+
+        ttk.Button(left, text="Run What-If Analysis",
+                   command=self._run_whatif).pack(fill=tk.X, padx=8, pady=8)
+
+        # Right panel — results
+        right = ttk.Frame(paned)
+        paned.add(right, weight=3)
+
+        self.lbl_whatif_results = ttk.Label(right, text="Configure changes and click 'Run What-If Analysis'",
+                                             font=("Helvetica", 11), wraplength=600,
+                                             justify=tk.LEFT)
+        self.lbl_whatif_results.pack(padx=12, pady=8, anchor=tk.NW)
+
+        t = self._theme
+        self.fig_whatif = Figure(figsize=(8, 5), dpi=100, facecolor=t["BG"])
+        self.fig_whatif.subplots_adjust(left=0.15, right=0.95, top=0.92, bottom=0.20)
+        self.ax_whatif = self.fig_whatif.add_subplot(111)
+        self.canvas_whatif = FigureCanvasTkAgg(self.fig_whatif, master=right)
+        self.canvas_whatif.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8)
+
+    def _run_whatif(self) -> None:
+        segments = self._get_whatif_segments()
+        if not segments:
+            messagebox.showwarning("No Course", "Add segments in the Course Profile tab first.")
+            return
+
+        rider, bike, _ = self._gather_params()
+        changes: list[WhatIfChange] = []
+
+        dw = self.var_wi_weight.get()
+        if abs(dw) > 0.1:
+            changes.append(WhatIfChange(
+                parameter="weight_kg",
+                label=f"Weight {dw:+.1f} kg",
+                original_value=rider.weight_kg,
+                new_value=rider.weight_kg + dw,
+            ))
+
+        dp = self.var_wi_power.get()
+        if abs(dp) > 0.1:
+            changes.append(WhatIfChange(
+                parameter="power_watts",
+                label=f"Power {dp:+.0f} W",
+                original_value=rider.power_watts,
+                new_value=rider.power_watts + dp,
+            ))
+
+        pos_val = self.var_wi_position.get()
+        if pos_val != "(no change)":
+            new_pos = next(p for p in RidingPosition if p.value == pos_val)
+            changes.append(WhatIfChange(
+                parameter="position",
+                label=f"Position \u2192 {pos_val}",
+                original_value=bike.position,
+                new_value=new_pos,
+            ))
+
+        tire_val = self.var_wi_tire.get()
+        if tire_val != "(no change)":
+            new_tire = next(t for t in TireType if t.value == tire_val)
+            changes.append(WhatIfChange(
+                parameter="tire_type",
+                label=f"Tires \u2192 {tire_val}",
+                original_value=bike.tire_type,
+                new_value=new_tire,
+            ))
+
+        dbw = self.var_wi_bike_weight.get()
+        if abs(dbw) > 0.1:
+            changes.append(WhatIfChange(
+                parameter="bike_weight_kg",
+                label=f"Bike {dbw:+.1f} kg",
+                original_value=bike.weight_kg,
+                new_value=bike.weight_kg + dbw,
+            ))
+
+        if not changes:
+            messagebox.showinfo("No Changes", "Adjust at least one parameter to see its impact.")
+            return
+
+        results = what_if_analysis(rider, bike, segments, changes)
+        self._display_whatif_results(results)
+
+    def _get_whatif_segments(self) -> list[CourseSegment]:
+        segments: list[CourseSegment] = []
+        for sv in self._course_segments:
+            segments.append(CourseSegment(
+                distance_m=sv["distance"].get(),
+                grade_pct=sv["grade"].get(),
+                headwind_kmh=sv["wind"].get(),
+                elevation_m=sv["elevation"].get(),
+                temperature_c=sv["temp"].get(),
+            ))
+        return segments
+
+    def _display_whatif_results(self, results: list) -> None:
+        imp = self._imperial
+        su = _speed_unit(imp)
+
+        text = "What-If Analysis Results:\n\n"
+        for r in results:
+            sign = "+" if r.time_diff_s > 0 else ""
+            speed_sign = "+" if r.speed_diff_kmh > 0 else ""
+            spd_diff = _convert_speed(r.speed_diff_kmh, imp)
+            text += (
+                f"\u2022 {r.change.label}\n"
+                f"    Time: {sign}{r.time_diff_s:.1f}s "
+                f"({r.pct_improvement:+.2f}%)\n"
+                f"    Speed: {speed_sign}{spd_diff:.1f} {su}\n\n"
+            )
+
+        base_time = results[0].original_time_s if results else 0
+        mins = int(base_time // 60)
+        secs = int(base_time % 60)
+        text += f"Baseline time: {mins}:{secs:02d}"
+        self.lbl_whatif_results.configure(text=text)
+
+        # Chart
+        t = self._theme
+        ax = self.ax_whatif
+        ax.clear()
+        _style_ax(ax, t)
+
+        chart_colors = [t[k] for k in CHART_COLOURS_KEYS]
+        labels = [r.change.label for r in results]
+        times = [r.time_diff_s for r in results]
+        colors = [t["SUCCESS"] if td > 0 else t["DANGER"] for td in times]
+
+        bars = ax.barh(labels, times, color=colors, edgecolor=t["BORDER"],
+                       alpha=0.85, height=0.5)
+        for bar, td in zip(bars, times):
+            sign = "+" if td > 0 else ""
+            ax.text(bar.get_width() + (0.5 if td >= 0 else -0.5),
+                    bar.get_y() + bar.get_height() / 2,
+                    f"{sign}{td:.1f}s", ha="left" if td >= 0 else "right",
+                    va="center", color=t["FG"], fontsize=9)
+
+        ax.axvline(0, color=t["FG"], linewidth=0.5, alpha=0.3)
+        ax.set_xlabel("Time Saved (seconds)", color=t["FG"], fontsize=9)
+        ax.set_title("Impact of Each Change", color=t["FG"], fontsize=11, fontweight="bold")
+        ax.invert_yaxis()
+
+        self.canvas_whatif.draw_idle()
+
+    # ==================================================================
+    # TAB 13: Segment KOM Predictor
+    # ==================================================================
+    def _build_kom_tab(self) -> None:
+        tab = ttk.Frame(self._notebook)
+        self._notebook.add(tab, text="  \U0001f3c6 KOM  ")
+
+        paned = ttk.PanedWindow(tab, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+
+        # Left panel
+        left = ttk.Frame(paned)
+        paned.add(left, weight=1)
+
+        info_card = self._card_frame(left, "Segment KOM Predictor")
+        ttk.Label(info_card,
+                  text="Predict your segment times and compare\n"
+                       "against category benchmarks (Cat 5 to Pro).\n"
+                       "Uses Course Profile segments.",
+                  font=("Helvetica", 9), wraplength=280,
+                  justify=tk.LEFT).pack(padx=8, pady=4, anchor=tk.W)
+
+        ttk.Button(info_card, text="Predict KOMs",
+                   command=self._run_kom_prediction).pack(fill=tk.X, padx=8, pady=4)
+
+        # Results summary
+        summ_card = self._card_frame(left, "Overall Standing")
+        self.lbl_kom_summary = ttk.Label(summ_card, text="Run prediction to see results",
+                                          font=("Helvetica", 10), wraplength=280,
+                                          justify=tk.LEFT)
+        self.lbl_kom_summary.pack(padx=8, pady=8, anchor=tk.W)
+
+        # Segment details
+        detail_card = self._card_frame(left, "Segment Details")
+        self.lbl_kom_details = ttk.Label(detail_card, text="",
+                                          font=("Helvetica", 9), wraplength=280,
+                                          justify=tk.LEFT)
+        self.lbl_kom_details.pack(padx=8, pady=8, anchor=tk.W)
+
+        # Right panel — charts
+        right = ttk.Frame(paned)
+        paned.add(right, weight=3)
+
+        t = self._theme
+        self.fig_kom = Figure(figsize=(8, 8), dpi=100, facecolor=t["BG"])
+        self.fig_kom.subplots_adjust(left=0.10, right=0.95, top=0.95, bottom=0.06,
+                                     hspace=0.35)
+        self.ax_kom_times = self.fig_kom.add_subplot(211)
+        self.ax_kom_ranking = self.fig_kom.add_subplot(212)
+        self.canvas_kom = FigureCanvasTkAgg(self.fig_kom, master=right)
+        self.canvas_kom.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    def _run_kom_prediction(self) -> None:
+        segments = self._get_whatif_segments()
+        if not segments:
+            messagebox.showwarning("No Course", "Add segments in the Course Profile tab first.")
+            return
+
+        rider, bike, _ = self._gather_params()
+        prediction = predict_kom(rider, bike, segments)
+
+        imp = self._imperial
+        su = _speed_unit(imp)
+
+        # Overall summary
+        rider_total = prediction.total_rider_time_s
+        r_mins = int(rider_total // 60)
+        r_secs = int(rider_total % 60)
+
+        # Determine overall rank
+        overall_rank = "Beginner"
+        for cat_name, cat_time in prediction.total_category_times:
+            if rider_total <= cat_time:
+                overall_rank = cat_name
+                break
+
+        summary = f"Your Total Time: {r_mins}:{r_secs:02d}\n"
+        summary += f"Overall Ranking: {overall_rank}\n\n"
+        summary += "Category Benchmarks:\n"
+        for cat_name, cat_time in prediction.total_category_times:
+            c_mins = int(cat_time // 60)
+            c_secs = int(cat_time % 60)
+            diff = rider_total - cat_time
+            diff_str = f"+{diff:.0f}s" if diff > 0 else f"{diff:.0f}s"
+            marker = " \u25c0" if cat_name == overall_rank else ""
+            summary += f"  {cat_name}: {c_mins}:{c_secs:02d} ({diff_str}){marker}\n"
+
+        self.lbl_kom_summary.configure(text=summary)
+
+        # Segment details
+        details = ""
+        for seg in prediction.segments:
+            s_mins = int(seg.rider_time_s // 60)
+            s_secs = int(seg.rider_time_s % 60)
+            spd = _convert_speed(seg.rider_speed_kmh, imp)
+            details += (
+                f"Seg {seg.segment_index + 1}: {seg.distance_m:.0f}m "
+                f"@ {seg.grade_pct:+.1f}%\n"
+                f"  Time: {s_mins}:{s_secs:02d}  "
+                f"Speed: {spd:.1f} {su}\n"
+                f"  Rank: {seg.rider_rank}\n\n"
+            )
+        self.lbl_kom_details.configure(text=details.strip())
+
+        self._update_kom_charts(prediction)
+
+    def _update_kom_charts(self, prediction: Any) -> None:
+        t = self._theme
+        imp = self._imperial
+
+        # Chart 1: Rider time vs category times per segment
+        ax1 = self.ax_kom_times
+        ax1.clear()
+        _style_ax(ax1, t)
+
+        n_segs = len(prediction.segments)
+        if n_segs == 0:
+            return
+
+        seg_labels = [f"Seg {s.segment_index + 1}\n{s.grade_pct:+.0f}%"
+                      for s in prediction.segments]
+        x = list(range(n_segs))
+        width = 0.12
+
+        # Plot a few key category benchmarks + rider
+        categories_to_show = ["World Tour Pro", "Cat 1", "Cat 3", "Cat 5"]
+        cat_colors = [t["ACCENT4"], t["ACCENT3"], t["ACCENT2"], t["ACCENT"]]
+
+        for ci, (cat_name, color) in enumerate(zip(categories_to_show, cat_colors)):
+            cat_times = []
+            for seg in prediction.segments:
+                for cn, ct, _ in seg.category_times:
+                    if cn == cat_name:
+                        cat_times.append(ct)
+                        break
+            offsets = [xi + (ci - 2) * width for xi in x]
+            ax1.bar(offsets, cat_times, width=width, color=color, alpha=0.7,
+                    label=cat_name, edgecolor=t["BORDER"], linewidth=0.5)
+
+        # Rider's times
+        rider_times = [s.rider_time_s for s in prediction.segments]
+        offsets_rider = [xi + 2 * width for xi in x]
+        ax1.bar(offsets_rider, rider_times, width=width, color=t["ACCENT4"],
+                alpha=1.0, label="You", edgecolor="#ffffff", linewidth=1.5)
+
+        ax1.set_xticks(x)
+        ax1.set_xticklabels(seg_labels, fontsize=8)
+        ax1.set_ylabel("Time (s)", color=t["FG"], fontsize=9)
+        ax1.set_title("Segment Times vs Category Benchmarks", color=t["FG"],
+                      fontsize=11, fontweight="bold")
+        ax1.legend(fontsize=7, facecolor=t["BG_LIGHT"], edgecolor=t["BORDER"],
+                   labelcolor=t["FG"], ncol=5)
+
+        # Chart 2: Overall ranking visualization
+        ax2 = self.ax_kom_ranking
+        ax2.clear()
+        _style_ax(ax2, t)
+
+        cat_names = [c[0] for c in prediction.total_category_times]
+        cat_times = [c[1] for c in prediction.total_category_times]
+
+        colors = [t[k] for k in CHART_COLOURS_KEYS]
+        bar_colors = [colors[i % len(colors)] for i in range(len(cat_names))]
+
+        bars = ax2.barh(cat_names, cat_times, color=bar_colors, alpha=0.6,
+                        edgecolor=t["BORDER"], height=0.6)
+
+        # Add rider's line
+        rider_total = prediction.total_rider_time_s
+        ax2.axvline(rider_total, color=t["ACCENT4"], linewidth=2.5,
+                    linestyle="--", label=f"You: {int(rider_total // 60)}:{int(rider_total % 60):02d}",
+                    zorder=10)
+
+        for bar, ct in zip(bars, cat_times):
+            m = int(ct // 60)
+            s = int(ct % 60)
+            ax2.text(bar.get_width() + 2, bar.get_y() + bar.get_height() / 2,
+                     f"{m}:{s:02d}", ha="left", va="center", color=t["FG"], fontsize=8)
+
+        ax2.set_xlabel("Total Time (s)", color=t["FG"], fontsize=9)
+        ax2.set_title("Overall Course Ranking", color=t["FG"], fontsize=11, fontweight="bold")
+        ax2.legend(fontsize=9, facecolor=t["BG_LIGHT"], edgecolor=t["BORDER"],
+                   labelcolor=t["FG"])
+        ax2.invert_yaxis()
+
+        self.canvas_kom.draw_idle()
+
+    # ==================================================================
+    # TAB 14: Export
     # ==================================================================
     def _build_export_tab(self) -> None:
         tab = ttk.Frame(self._notebook)

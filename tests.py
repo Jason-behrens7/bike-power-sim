@@ -13,7 +13,9 @@ from simulation import (
     CourseParams,
     CourseSegment,
     CriticalPowerModel,
+    GPXRidePoint,
     IntervalStep,
+    KOM_BENCHMARKS,
     Preset,
     RaceCompetitor,
     RealTimeState,
@@ -21,8 +23,10 @@ from simulation import (
     RiderParams,
     RidingPosition,
     TireType,
+    WhatIfChange,
     ZONE_NAMES,
     air_density,
+    analyze_ride,
     calculate_cda,
     classify_rider,
     compute_elevation_at_distance,
@@ -44,6 +48,7 @@ from simulation import (
     parse_gpx_with_coords,
     power_to_weight_ratio,
     power_zones,
+    predict_kom,
     resistive_forces,
     save_presets,
     simulate_course_profile,
@@ -54,6 +59,7 @@ from simulation import (
     validate_all,
     validate_param,
     w_per_kg_analysis,
+    what_if_analysis,
     wheel_inertia_factor,
     zone_for_power,
     # Unit conversions
@@ -1036,6 +1042,136 @@ class TestRealTimeTick(unittest.TestCase):
             prev_calories=20,
         )
         self.assertGreater(state.avg_speed_kmh, 0)
+
+
+class TestRideAnalysis(unittest.TestCase):
+    def _make_ride_points(self) -> list[GPXRidePoint]:
+        points = []
+        for i in range(20):
+            points.append(GPXRidePoint(
+                time_s=float(i * 10),
+                distance_m=float(i * 100),
+                elevation_m=100.0 + i * 2,
+                speed_kmh=25.0 + (i % 5),
+                grade_pct=2.0,
+                lat=40.0 + i * 0.001,
+                lon=-74.0 + i * 0.001,
+                power_watts=200.0,
+            ))
+        return points
+
+    def test_analyze_ride_returns_result(self) -> None:
+        points = self._make_ride_points()
+        rider = RiderParams(power_watts=200, weight_kg=75)
+        bike = BikeParams()
+        result = analyze_ride(points, rider, bike)
+        self.assertGreater(len(result.predicted_speeds), 0)
+        self.assertGreater(len(result.actual_speeds), 0)
+        self.assertEqual(len(result.predicted_speeds), len(result.actual_speeds))
+
+    def test_error_metrics_computed(self) -> None:
+        points = self._make_ride_points()
+        rider = RiderParams(power_watts=200, weight_kg=75)
+        bike = BikeParams()
+        result = analyze_ride(points, rider, bike)
+        self.assertIsInstance(result.mean_error_kmh, float)
+        self.assertIsInstance(result.rmse_kmh, float)
+        self.assertGreaterEqual(result.rmse_kmh, 0)
+
+    def test_too_few_points_raises(self) -> None:
+        points = [GPXRidePoint(
+            time_s=0, distance_m=0, elevation_m=100, speed_kmh=0,
+            grade_pct=0, lat=40, lon=-74,
+        )]
+        rider = RiderParams(power_watts=200, weight_kg=75)
+        bike = BikeParams()
+        with self.assertRaises(ValueError):
+            analyze_ride(points, rider, bike)
+
+
+class TestWhatIfAnalysis(unittest.TestCase):
+    def setUp(self) -> None:
+        self.rider = RiderParams(power_watts=250, weight_kg=75)
+        self.bike = BikeParams()
+        self.segments = [
+            CourseSegment(distance_m=5000, grade_pct=0),
+            CourseSegment(distance_m=2000, grade_pct=5),
+        ]
+
+    def test_weight_loss_faster(self) -> None:
+        changes = [WhatIfChange(
+            parameter="weight_kg", label="-5kg",
+            original_value=75, new_value=70,
+        )]
+        results = what_if_analysis(self.rider, self.bike, self.segments, changes)
+        self.assertEqual(len(results), 1)
+        self.assertGreater(results[0].time_diff_s, 0)  # Faster
+
+    def test_more_power_faster(self) -> None:
+        changes = [WhatIfChange(
+            parameter="power_watts", label="+50W",
+            original_value=250, new_value=300,
+        )]
+        results = what_if_analysis(self.rider, self.bike, self.segments, changes)
+        self.assertGreater(results[0].time_diff_s, 0)
+        self.assertGreater(results[0].speed_diff_kmh, 0)
+
+    def test_aero_position_impact(self) -> None:
+        changes = [WhatIfChange(
+            parameter="position", label="Aerobars",
+            original_value=RidingPosition.HOODS,
+            new_value=RidingPosition.AEROBARS,
+        )]
+        results = what_if_analysis(self.rider, self.bike, self.segments, changes)
+        self.assertGreater(results[0].time_diff_s, 0)  # Aero = faster
+
+    def test_multiple_changes(self) -> None:
+        changes = [
+            WhatIfChange("weight_kg", "-3kg", 75, 72),
+            WhatIfChange("power_watts", "+20W", 250, 270),
+            WhatIfChange("position", "Drops", RidingPosition.HOODS, RidingPosition.DROPS),
+        ]
+        results = what_if_analysis(self.rider, self.bike, self.segments, changes)
+        self.assertEqual(len(results), 3)
+        for r in results:
+            self.assertGreater(r.time_diff_s, 0)
+
+
+class TestKOMPrediction(unittest.TestCase):
+    def setUp(self) -> None:
+        self.rider = RiderParams(power_watts=250, weight_kg=75)
+        self.bike = BikeParams()
+        self.segments = [
+            CourseSegment(distance_m=3000, grade_pct=5),
+            CourseSegment(distance_m=2000, grade_pct=0),
+        ]
+
+    def test_basic_prediction(self) -> None:
+        result = predict_kom(self.rider, self.bike, self.segments)
+        self.assertEqual(len(result.segments), 2)
+        self.assertGreater(result.total_rider_time_s, 0)
+
+    def test_category_times_present(self) -> None:
+        result = predict_kom(self.rider, self.bike, self.segments)
+        self.assertEqual(len(result.total_category_times), len(KOM_BENCHMARKS))
+        for name, time in result.total_category_times:
+            self.assertGreater(time, 0)
+
+    def test_pro_faster_than_beginner(self) -> None:
+        result = predict_kom(self.rider, self.bike, self.segments)
+        cat_dict = {name: time for name, time in result.total_category_times}
+        self.assertLess(cat_dict["World Tour Pro"], cat_dict["Beginner"])
+
+    def test_segment_rank_assigned(self) -> None:
+        result = predict_kom(self.rider, self.bike, self.segments)
+        for seg in result.segments:
+            self.assertIsInstance(seg.rider_rank, str)
+            self.assertTrue(len(seg.rider_rank) > 0)
+
+    def test_elevation_gain_calculated(self) -> None:
+        result = predict_kom(self.rider, self.bike, self.segments)
+        uphill_seg = result.segments[0]  # 5% grade
+        self.assertGreater(uphill_seg.elevation_gain_m, 0)
 
 
 if __name__ == "__main__":
