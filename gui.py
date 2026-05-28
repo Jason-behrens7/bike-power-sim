@@ -2523,7 +2523,7 @@ class BikeSimApp(tk.Tk):
         left = ttk.Frame(paned)
         paned.add(left, weight=1)
 
-        ctrl = self._card_frame(left, "GPX Ride Import")
+        ctrl = self._make_card(left, "GPX Ride Import")
 
         ttk.Button(ctrl, text="Load GPX Ride File",
                    command=self._load_ride_gpx).pack(fill=tk.X, padx=8, pady=4)
@@ -2546,14 +2546,14 @@ class BikeSimApp(tk.Tk):
                    command=self._reanalyze_ride).pack(fill=tk.X, padx=8, pady=4)
 
         # Model accuracy card
-        acc_card = self._card_frame(left, "Model Accuracy")
+        acc_card = self._make_card(left, "Model Accuracy")
         self.lbl_ride_accuracy = ttk.Label(acc_card, text="Load a GPX file to begin",
                                             font=("Helvetica", 10), wraplength=280,
                                             justify=tk.LEFT)
         self.lbl_ride_accuracy.pack(padx=8, pady=8, anchor=tk.W)
 
         # Ride summary card
-        summ_card = self._card_frame(left, "Ride Summary")
+        summ_card = self._make_card(left, "Ride Summary")
         self.lbl_ride_summary = ttk.Label(summ_card, text="",
                                            font=("Helvetica", 10), wraplength=280,
                                            justify=tk.LEFT)
@@ -2708,7 +2708,7 @@ class BikeSimApp(tk.Tk):
         left = ttk.Frame(paned)
         paned.add(left, weight=1)
 
-        info_card = self._card_frame(left, "What-If Analysis")
+        info_card = self._make_card(left, "What-If Analysis")
         ttk.Label(info_card,
                   text="See how changes affect your course time.\n"
                        "Uses the Course Profile segments.",
@@ -2716,31 +2716,31 @@ class BikeSimApp(tk.Tk):
                   justify=tk.LEFT).pack(padx=8, pady=4, anchor=tk.W)
 
         # Weight change
-        wt_card = self._card_frame(left, "Weight Change (kg)")
+        wt_card = self._make_card(left, "Weight Change (kg)")
         self.var_wi_weight = tk.DoubleVar(value=-2.0)
         self._add_slider(wt_card, "\u0394 Weight", self.var_wi_weight, -10, 10, 0.5, "kg")
 
         # Power change
-        pw_card = self._card_frame(left, "Power Change (W)")
+        pw_card = self._make_card(left, "Power Change (W)")
         self.var_wi_power = tk.DoubleVar(value=20.0)
         self._add_slider(pw_card, "\u0394 Power", self.var_wi_power, -100, 100, 5, "W")
 
         # Position change
-        pos_card = self._card_frame(left, "Riding Position")
+        pos_card = self._make_card(left, "Riding Position")
         self.var_wi_position = tk.StringVar(value="(no change)")
         positions = ["(no change)"] + [p.value for p in RidingPosition]
         ttk.OptionMenu(pos_card, self.var_wi_position,
                        positions[0], *positions).pack(fill=tk.X, padx=8, pady=4)
 
         # Tire change
-        tire_card = self._card_frame(left, "Tire Type")
+        tire_card = self._make_card(left, "Tire Type")
         self.var_wi_tire = tk.StringVar(value="(no change)")
         tires = ["(no change)"] + [t.value for t in TireType]
         ttk.OptionMenu(tire_card, self.var_wi_tire,
                        tires[0], *tires).pack(fill=tk.X, padx=8, pady=4)
 
         # Bike weight change
-        bw_card = self._card_frame(left, "Bike Weight Change (kg)")
+        bw_card = self._make_card(left, "Bike Weight Change (kg)")
         self.var_wi_bike_weight = tk.DoubleVar(value=0.0)
         self._add_slider(bw_card, "\u0394 Bike", self.var_wi_bike_weight, -5, 5, 0.5, "kg")
 
@@ -2901,7 +2901,7 @@ class BikeSimApp(tk.Tk):
         left = ttk.Frame(paned)
         paned.add(left, weight=1)
 
-        info_card = self._card_frame(left, "Segment KOM Predictor")
+        info_card = self._make_card(left, "Segment KOM Predictor")
         ttk.Label(info_card,
                   text="Predict your segment times and compare\n"
                        "against category benchmarks (Cat 5 to Pro).\n"
@@ -2913,14 +2913,14 @@ class BikeSimApp(tk.Tk):
                    command=self._run_kom_prediction).pack(fill=tk.X, padx=8, pady=4)
 
         # Results summary
-        summ_card = self._card_frame(left, "Overall Standing")
+        summ_card = self._make_card(left, "Overall Standing")
         self.lbl_kom_summary = ttk.Label(summ_card, text="Run prediction to see results",
                                           font=("Helvetica", 10), wraplength=280,
                                           justify=tk.LEFT)
         self.lbl_kom_summary.pack(padx=8, pady=8, anchor=tk.W)
 
         # Segment details
-        detail_card = self._card_frame(left, "Segment Details")
+        detail_card = self._make_card(left, "Segment Details")
         self.lbl_kom_details = ttk.Label(detail_card, text="",
                                           font=("Helvetica", 9), wraplength=280,
                                           justify=tk.LEFT)
