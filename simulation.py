@@ -1392,3 +1392,149 @@ PRESETS: list[Preset] = [
                             temperature_c=35),
     ),
 ]
+
+
+# ---------------------------------------------------------------------------
+# Real-time simulation support
+# ---------------------------------------------------------------------------
+
+@dataclass
+class RealTimeState:
+    """Instantaneous state during a real-time ride simulation."""
+    elapsed_time_s: float
+    distance_m: float
+    current_speed_kmh: float
+    current_speed_ms: float
+    current_power_watts: float
+    current_grade_pct: float
+    current_elevation_m: float
+    segment_index: int
+    segment_progress: float
+    w_prime_balance_j: float
+    w_prime_max_j: float
+    avg_speed_kmh: float
+    total_distance_m: float
+    calories_kcal: float
+    power_zone_name: str
+    power_zone_color: str
+    is_finished: bool
+
+
+def find_segment_at_distance(
+    segments: list[CourseSegment],
+    distance_m: float,
+) -> tuple[int, float, float]:
+    """Find which segment the rider is in at a given distance.
+
+    Returns (segment_index, distance_into_segment, cumulative_distance_to_segment_start).
+    """
+    cumulative = 0.0
+    for i, seg in enumerate(segments):
+        if cumulative + seg.distance_m > distance_m:
+            return i, distance_m - cumulative, cumulative
+        cumulative += seg.distance_m
+    return len(segments) - 1, 0.0, cumulative
+
+
+def compute_elevation_at_distance(
+    segments: list[CourseSegment],
+    distance_m: float,
+) -> float:
+    """Compute the rider's elevation at a given distance along the course."""
+    cumulative = 0.0
+    elevation = segments[0].elevation_m if segments else 0.0
+
+    for seg in segments:
+        seg_end_dist = cumulative + seg.distance_m
+        if distance_m <= seg_end_dist:
+            dist_into = distance_m - cumulative
+            elev_change = dist_into * math.sin(grade_to_radians(seg.grade_pct))
+            return elevation + elev_change
+        elev_change = seg.distance_m * math.sin(grade_to_radians(seg.grade_pct))
+        elevation += elev_change
+        cumulative = seg_end_dist
+
+    return elevation
+
+
+def compute_realtime_tick(
+    rider: RiderParams,
+    bike: BikeParams,
+    segments: list[CourseSegment],
+    power_watts: float,
+    ftp: float,
+    cp_model: CriticalPowerModel | None,
+    elapsed_time_s: float,
+    dt: float,
+    prev_distance_m: float,
+    prev_w_prime_j: float,
+    prev_calories: float,
+) -> RealTimeState:
+    """Advance a real-time ride simulation by one time step.
+
+    The rider's speed is solved from the current segment's conditions
+    and the supplied power_watts (which can change each tick).
+    """
+    total_distance = sum(seg.distance_m for seg in segments)
+
+    seg_idx, dist_into_seg, cum_to_seg = find_segment_at_distance(
+        segments, min(prev_distance_m, total_distance - 0.01)
+    )
+    seg = segments[seg_idx]
+    seg_progress = dist_into_seg / seg.distance_m if seg.distance_m > 0 else 1.0
+
+    current_elevation = compute_elevation_at_distance(segments, prev_distance_m)
+
+    course = CourseParams(
+        grade_pct=seg.grade_pct,
+        headwind_kmh=seg.headwind_kmh,
+        wind_direction_deg=seg.wind_direction_deg,
+        elevation_m=current_elevation,
+        temperature_c=seg.temperature_c,
+    )
+    result = solve_speed(rider, bike, course, power_override=power_watts)
+
+    new_distance = prev_distance_m + result.speed_ms * dt
+    is_finished = new_distance >= total_distance
+    new_distance = min(new_distance, total_distance)
+
+    # W' balance tracking
+    if cp_model is not None:
+        if power_watts > cp_model.cp_watts:
+            w_prime_spent = (power_watts - cp_model.cp_watts) * dt
+            new_w_prime = max(0.0, prev_w_prime_j - w_prime_spent)
+        else:
+            tau = 546.0 * math.exp(-0.01 * (cp_model.cp_watts - power_watts)) + 316.0
+            recovery = (cp_model.w_prime_joules - prev_w_prime_j) * (1 - math.exp(-dt / tau))
+            new_w_prime = min(cp_model.w_prime_joules, prev_w_prime_j + recovery)
+        w_prime_max = cp_model.w_prime_joules
+    else:
+        new_w_prime = prev_w_prime_j
+        w_prime_max = prev_w_prime_j
+
+    new_calories = prev_calories + estimate_calories(power_watts, dt)
+
+    zone_name, zone_color = zone_for_power(power_watts, ftp)
+
+    new_elapsed = elapsed_time_s + dt
+    avg_speed = (new_distance / new_elapsed * 3.6) if new_elapsed > 0 else 0.0
+
+    return RealTimeState(
+        elapsed_time_s=new_elapsed,
+        distance_m=new_distance,
+        current_speed_kmh=result.speed_kmh,
+        current_speed_ms=result.speed_ms,
+        current_power_watts=power_watts,
+        current_grade_pct=seg.grade_pct,
+        current_elevation_m=current_elevation,
+        segment_index=seg_idx,
+        segment_progress=seg_progress,
+        w_prime_balance_j=new_w_prime,
+        w_prime_max_j=w_prime_max,
+        avg_speed_kmh=avg_speed,
+        total_distance_m=total_distance,
+        calories_kcal=new_calories,
+        power_zone_name=zone_name,
+        power_zone_color=zone_color,
+        is_finished=is_finished,
+    )

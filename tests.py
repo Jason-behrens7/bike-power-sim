@@ -16,6 +16,7 @@ from simulation import (
     IntervalStep,
     Preset,
     RaceCompetitor,
+    RealTimeState,
     RIDER_CATEGORIES,
     RiderParams,
     RidingPosition,
@@ -24,6 +25,8 @@ from simulation import (
     air_density,
     calculate_cda,
     classify_rider,
+    compute_elevation_at_distance,
+    compute_realtime_tick,
     effective_headwind,
     estimate_calories,
     estimate_cp_from_ftp,
@@ -32,6 +35,7 @@ from simulation import (
     export_course_csv,
     export_result_csv,
     export_workout_csv,
+    find_segment_at_distance,
     fit_cp_model,
     grade_to_radians,
     load_presets,
@@ -853,6 +857,185 @@ class TestPacingOptimization(unittest.TestCase):
         segs = [CourseSegment(distance_m=5000, grade_pct=0)]
         result = optimize_pacing(rider, bike, segs, ftp=250)
         self.assertGreater(result.avg_speed_kmh, 0)
+
+
+class TestFindSegmentAtDistance(unittest.TestCase):
+    def setUp(self) -> None:
+        self.segments = [
+            CourseSegment(distance_m=1000, grade_pct=0),
+            CourseSegment(distance_m=2000, grade_pct=5),
+            CourseSegment(distance_m=1500, grade_pct=-3),
+        ]
+
+    def test_at_start(self) -> None:
+        idx, dist_into, cum = find_segment_at_distance(self.segments, 0)
+        self.assertEqual(idx, 0)
+        self.assertAlmostEqual(dist_into, 0.0)
+
+    def test_in_first_segment(self) -> None:
+        idx, dist_into, cum = find_segment_at_distance(self.segments, 500)
+        self.assertEqual(idx, 0)
+        self.assertAlmostEqual(dist_into, 500.0)
+
+    def test_in_second_segment(self) -> None:
+        idx, dist_into, cum = find_segment_at_distance(self.segments, 1500)
+        self.assertEqual(idx, 1)
+        self.assertAlmostEqual(dist_into, 500.0)
+        self.assertAlmostEqual(cum, 1000.0)
+
+    def test_in_third_segment(self) -> None:
+        idx, dist_into, cum = find_segment_at_distance(self.segments, 3500)
+        self.assertEqual(idx, 2)
+        self.assertAlmostEqual(dist_into, 500.0)
+        self.assertAlmostEqual(cum, 3000.0)
+
+    def test_past_end(self) -> None:
+        total = sum(s.distance_m for s in self.segments)
+        idx, _, _ = find_segment_at_distance(self.segments, total + 100)
+        self.assertEqual(idx, 2)
+
+
+class TestComputeElevation(unittest.TestCase):
+    def test_flat_course(self) -> None:
+        segs = [CourseSegment(distance_m=1000, grade_pct=0, elevation_m=100)]
+        elev = compute_elevation_at_distance(segs, 500)
+        self.assertAlmostEqual(elev, 100.0, places=0)
+
+    def test_uphill(self) -> None:
+        segs = [CourseSegment(distance_m=1000, grade_pct=10, elevation_m=100)]
+        elev = compute_elevation_at_distance(segs, 1000)
+        self.assertGreater(elev, 100)
+
+    def test_downhill(self) -> None:
+        segs = [CourseSegment(distance_m=1000, grade_pct=-5, elevation_m=200)]
+        elev = compute_elevation_at_distance(segs, 1000)
+        self.assertLess(elev, 200)
+
+    def test_multi_segment(self) -> None:
+        segs = [
+            CourseSegment(distance_m=1000, grade_pct=5, elevation_m=100),
+            CourseSegment(distance_m=1000, grade_pct=-5, elevation_m=100),
+        ]
+        elev_mid = compute_elevation_at_distance(segs, 1000)
+        self.assertGreater(elev_mid, 100)
+
+
+class TestRealTimeTick(unittest.TestCase):
+    def setUp(self) -> None:
+        self.rider = RiderParams(power_watts=200, weight_kg=75, height_cm=178)
+        self.bike = BikeParams()
+        self.segments = [
+            CourseSegment(distance_m=2000, grade_pct=0),
+            CourseSegment(distance_m=1000, grade_pct=5),
+        ]
+        self.cp = estimate_cp_from_ftp(250)
+
+    def test_basic_tick(self) -> None:
+        state = compute_realtime_tick(
+            self.rider, self.bike, self.segments,
+            power_watts=200, ftp=250, cp_model=self.cp,
+            elapsed_time_s=0, dt=1.0,
+            prev_distance_m=0, prev_w_prime_j=self.cp.w_prime_joules,
+            prev_calories=0,
+        )
+        self.assertIsInstance(state, RealTimeState)
+        self.assertGreater(state.current_speed_kmh, 0)
+        self.assertGreater(state.distance_m, 0)
+        self.assertGreater(state.elapsed_time_s, 0)
+
+    def test_distance_increases(self) -> None:
+        state1 = compute_realtime_tick(
+            self.rider, self.bike, self.segments,
+            power_watts=200, ftp=250, cp_model=self.cp,
+            elapsed_time_s=0, dt=1.0,
+            prev_distance_m=0, prev_w_prime_j=self.cp.w_prime_joules,
+            prev_calories=0,
+        )
+        state2 = compute_realtime_tick(
+            self.rider, self.bike, self.segments,
+            power_watts=200, ftp=250, cp_model=self.cp,
+            elapsed_time_s=state1.elapsed_time_s, dt=1.0,
+            prev_distance_m=state1.distance_m,
+            prev_w_prime_j=state1.w_prime_balance_j,
+            prev_calories=state1.calories_kcal,
+        )
+        self.assertGreater(state2.distance_m, state1.distance_m)
+
+    def test_wprime_depletes_above_cp(self) -> None:
+        high_power = self.cp.cp_watts + 100
+        state = compute_realtime_tick(
+            self.rider, self.bike, self.segments,
+            power_watts=high_power, ftp=250, cp_model=self.cp,
+            elapsed_time_s=0, dt=10.0,
+            prev_distance_m=0, prev_w_prime_j=self.cp.w_prime_joules,
+            prev_calories=0,
+        )
+        self.assertLess(state.w_prime_balance_j, self.cp.w_prime_joules)
+
+    def test_wprime_recovers_below_cp(self) -> None:
+        depleted = self.cp.w_prime_joules * 0.5
+        state = compute_realtime_tick(
+            self.rider, self.bike, self.segments,
+            power_watts=100, ftp=250, cp_model=self.cp,
+            elapsed_time_s=60, dt=30.0,
+            prev_distance_m=500, prev_w_prime_j=depleted,
+            prev_calories=10,
+        )
+        self.assertGreater(state.w_prime_balance_j, depleted)
+
+    def test_finish_detection(self) -> None:
+        total_dist = sum(s.distance_m for s in self.segments)
+        state = compute_realtime_tick(
+            self.rider, self.bike, self.segments,
+            power_watts=200, ftp=250, cp_model=self.cp,
+            elapsed_time_s=0, dt=1.0,
+            prev_distance_m=total_dist - 0.5,
+            prev_w_prime_j=self.cp.w_prime_joules,
+            prev_calories=0,
+        )
+        self.assertTrue(state.is_finished)
+
+    def test_calories_accumulate(self) -> None:
+        state = compute_realtime_tick(
+            self.rider, self.bike, self.segments,
+            power_watts=200, ftp=250, cp_model=self.cp,
+            elapsed_time_s=0, dt=60.0,
+            prev_distance_m=0, prev_w_prime_j=self.cp.w_prime_joules,
+            prev_calories=50,
+        )
+        self.assertGreater(state.calories_kcal, 50)
+
+    def test_power_zone_assigned(self) -> None:
+        state = compute_realtime_tick(
+            self.rider, self.bike, self.segments,
+            power_watts=200, ftp=250, cp_model=self.cp,
+            elapsed_time_s=0, dt=1.0,
+            prev_distance_m=0, prev_w_prime_j=self.cp.w_prime_joules,
+            prev_calories=0,
+        )
+        self.assertIsInstance(state.power_zone_name, str)
+        self.assertTrue(len(state.power_zone_name) > 0)
+        self.assertTrue(state.power_zone_color.startswith("#"))
+
+    def test_no_cp_model(self) -> None:
+        state = compute_realtime_tick(
+            self.rider, self.bike, self.segments,
+            power_watts=200, ftp=250, cp_model=None,
+            elapsed_time_s=0, dt=1.0,
+            prev_distance_m=0, prev_w_prime_j=20000,
+            prev_calories=0,
+        )
+        self.assertEqual(state.w_prime_balance_j, 20000)
+
+    def test_avg_speed_computed(self) -> None:
+        state = compute_realtime_tick(
+            self.rider, self.bike, self.segments,
+            power_watts=200, ftp=250, cp_model=self.cp,
+            elapsed_time_s=100, dt=10.0,
+            prev_distance_m=1000, prev_w_prime_j=self.cp.w_prime_joules,
+            prev_calories=20,
+        )
+        self.assertGreater(state.avg_speed_kmh, 0)
 
 
 if __name__ == "__main__":

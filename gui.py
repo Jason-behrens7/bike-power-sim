@@ -1,12 +1,14 @@
 """Bike Power Simulator — Tkinter GUI.
 
 Provides an interactive tabbed interface with simulation, course profiles,
-workout intervals, GPX import, scenario comparison, and export.
+workout intervals, GPX import, scenario comparison, real-time ride simulation,
+and export capabilities.
 """
 
 from __future__ import annotations
 
 import datetime
+import math
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
 from typing import Any
@@ -26,6 +28,7 @@ from simulation import (
     PRESETS,
     Preset,
     RaceCompetitor,
+    RealTimeState,
     RIDER_CATEGORIES,
     RiderParams,
     RidingPosition,
@@ -34,12 +37,15 @@ from simulation import (
     ZONE_COLORS,
     ZONE_NAMES,
     classify_rider,
+    compute_elevation_at_distance,
+    compute_realtime_tick,
     estimate_calories,
     estimate_cp_from_ftp,
     export_comparison_csv,
     export_course_csv,
     export_result_csv,
     export_workout_csv,
+    find_segment_at_distance,
     fit_cp_model,
     load_presets,
     optimize_pacing,
@@ -65,28 +71,34 @@ from simulation import (
 )
 
 # ---------------------------------------------------------------------------
-# Colour palettes
+# Colour palettes — Catppuccin with extended surface layers
 # ---------------------------------------------------------------------------
-# Dark theme (Catppuccin Mocha)
 DARK = {
     "BG": "#1e1e2e", "BG_LIGHT": "#262637", "FG": "#cdd6f4",
-    "FG_DIM": "#6c7086", "ACCENT": "#89b4fa", "ACCENT2": "#a6e3a1",
-    "ACCENT3": "#f9e2af", "ACCENT4": "#f38ba8", "BORDER": "#393950",
+    "FG_DIM": "#6c7086", "FG_BRIGHT": "#f5f5ff",
+    "ACCENT": "#89b4fa", "ACCENT2": "#a6e3a1", "ACCENT3": "#f9e2af",
+    "ACCENT4": "#f38ba8", "BORDER": "#393950",
     "ENTRY_BG": "#313244", "ERROR_FG": "#f38ba8",
-    "SURFACE0": "#313244", "SURFACE1": "#45475a",
+    "SURFACE0": "#313244", "SURFACE1": "#45475a", "SURFACE2": "#585b70",
+    "CARD_BG": "#2a2a3d", "CARD_BORDER": "#3b3b55",
+    "TOOLBAR_BG": "#181825", "STATUS_BG": "#11111b",
+    "SUCCESS": "#a6e3a1", "WARNING": "#f9e2af", "DANGER": "#f38ba8",
+    "GAUGE_BG": "#313244", "GAUGE_TRACK": "#45475a",
 }
-# Light theme (Catppuccin Latte)
 LIGHT = {
     "BG": "#eff1f5", "BG_LIGHT": "#e6e9ef", "FG": "#4c4f69",
-    "FG_DIM": "#8c8fa1", "ACCENT": "#1e66f5", "ACCENT2": "#40a02b",
-    "ACCENT3": "#df8e1d", "ACCENT4": "#d20f39", "BORDER": "#ccd0da",
+    "FG_DIM": "#8c8fa1", "FG_BRIGHT": "#1e1e2e",
+    "ACCENT": "#1e66f5", "ACCENT2": "#40a02b", "ACCENT3": "#df8e1d",
+    "ACCENT4": "#d20f39", "BORDER": "#ccd0da",
     "ENTRY_BG": "#ccd0da", "ERROR_FG": "#d20f39",
-    "SURFACE0": "#ccd0da", "SURFACE1": "#bcc0cc",
+    "SURFACE0": "#ccd0da", "SURFACE1": "#bcc0cc", "SURFACE2": "#acb0be",
+    "CARD_BG": "#dce0e8", "CARD_BORDER": "#bcc0cc",
+    "TOOLBAR_BG": "#dce0e8", "STATUS_BG": "#ccd0da",
+    "SUCCESS": "#40a02b", "WARNING": "#df8e1d", "DANGER": "#d20f39",
+    "GAUGE_BG": "#ccd0da", "GAUGE_TRACK": "#bcc0cc",
 }
 
 CHART_COLOURS_KEYS = ["ACCENT", "ACCENT2", "ACCENT3", "ACCENT4"]
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -113,10 +125,21 @@ def _make_scale(
 def _style_ax(ax: Any, theme: dict, bg_key: str = "BG_LIGHT") -> None:
     """Apply theme colours to a matplotlib axes."""
     ax.set_facecolor(theme[bg_key])
-    ax.tick_params(colors=theme["FG"], labelsize=8)
-    ax.grid(True, alpha=0.2, color=theme["FG"])
+    ax.tick_params(colors=theme["FG"], labelsize=8, length=3, width=0.5)
+    ax.grid(True, alpha=0.15, color=theme["FG"], linewidth=0.5)
     for spine in ax.spines.values():
         spine.set_color(theme["BORDER"])
+        spine.set_linewidth(0.5)
+
+
+def _format_time(seconds: float) -> str:
+    """Format seconds as HH:MM:SS or MM:SS."""
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    if h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m}:{s:02d}"
 
 
 # ---------------------------------------------------------------------------
@@ -128,9 +151,9 @@ class BikeSimApp(tk.Tk):
 
     def __init__(self) -> None:
         super().__init__()
-        self.title("Bike Power Simulator")
-        self.minsize(1200, 800)
-        self.geometry("1400x900")
+        self.title("\u26f2  Bike Power Simulator")
+        self.minsize(1280, 860)
+        self.geometry("1500x950")
 
         self._theme = DARK
         self._imperial = False
@@ -140,6 +163,20 @@ class BikeSimApp(tk.Tk):
         self._interval_steps: list[dict[str, tk.DoubleVar]] = []
         self._animation_id: str | None = None
         self._last_course_result: Any = None
+        self._last_result: SimulationResult | None = None
+
+        # Real-time simulation state
+        self._rt_running = False
+        self._rt_timer_id: str | None = None
+        self._rt_elapsed = 0.0
+        self._rt_distance = 0.0
+        self._rt_w_prime = 0.0
+        self._rt_calories = 0.0
+        self._rt_speed_history: list[float] = []
+        self._rt_power_history: list[float] = []
+        self._rt_time_history: list[float] = []
+        self._rt_elev_history: list[float] = []
+        self._rt_grade_history: list[float] = []
 
         self._apply_theme()
         self._create_variables()
@@ -159,7 +196,8 @@ class BikeSimApp(tk.Tk):
         _font = ("Helvetica", 10)
         _font_bold = ("Helvetica", 10, "bold")
         _font_sm = ("Helvetica", 9)
-        _font_heading = ("Helvetica", 11, "bold")
+        _font_heading = ("Helvetica", 12, "bold")
+        _font_title = ("Helvetica", 14, "bold")
 
         style.configure(".", background=t["BG"], foreground=t["FG"],
                         fieldbackground=t["ENTRY_BG"], borderwidth=0,
@@ -173,30 +211,38 @@ class BikeSimApp(tk.Tk):
         style.configure("TScale", background=t["BG"],
                         troughcolor=t["SURFACE0"])
         style.configure("TButton", background=t["ACCENT"], foreground="#ffffff",
-                        font=_font_bold, padding=(10, 5))
+                        font=_font_bold, padding=(12, 6))
         style.map("TButton",
                   background=[("active", t["ACCENT2"]), ("disabled", t["BORDER"])],
                   foreground=[("active", "#ffffff"), ("disabled", t.get("FG_DIM", t["BORDER"]))])
         style.configure("Secondary.TButton", background=t["SURFACE0"],
-                        foreground=t["FG"], font=_font, padding=(8, 4))
+                        foreground=t["FG"], font=_font, padding=(10, 5))
         style.map("Secondary.TButton",
                   background=[("active", t["SURFACE1"])])
+        style.configure("Success.TButton", background=t["SUCCESS"],
+                        foreground="#1e1e2e", font=_font_bold, padding=(12, 6))
+        style.map("Success.TButton",
+                  background=[("active", t["ACCENT2"])])
+        style.configure("Danger.TButton", background=t["DANGER"],
+                        foreground="#ffffff", font=_font_bold, padding=(12, 6))
+        style.map("Danger.TButton",
+                  background=[("active", t["ACCENT4"])])
         style.configure("TCombobox", fieldbackground=t["ENTRY_BG"],
                         background=t["ENTRY_BG"], foreground=t["FG"],
-                        arrowcolor=t["FG"], padding=3)
+                        arrowcolor=t["FG"], padding=4)
         style.configure("TCheckbutton", background=t["BG"], foreground=t["FG"])
         style.configure("TNotebook", background=t["BG"], borderwidth=0)
         style.configure("TNotebook.Tab", background=t["SURFACE0"],
                         foreground=t["FG"],
-                        padding=[14, 5], font=_font_bold)
+                        padding=[16, 6], font=_font_bold)
         style.map("TNotebook.Tab",
                   background=[("selected", t["ACCENT"])],
                   foreground=[("selected", "#ffffff")])
-        style.configure("Result.TLabel", font=("Helvetica", 32, "bold"),
+        style.configure("Result.TLabel", font=("Helvetica", 36, "bold"),
                         foreground=t["ACCENT2"], background=t["BG"])
-        style.configure("ResultUnit.TLabel", font=("Helvetica", 13),
+        style.configure("ResultUnit.TLabel", font=("Helvetica", 14),
                         foreground=t.get("FG_DIM", t["FG"]), background=t["BG"])
-        style.configure("Preset.TButton", font=_font_sm, padding=(6, 3),
+        style.configure("Preset.TButton", font=_font_sm, padding=(8, 4),
                         background=t["SURFACE0"], foreground=t["FG"])
         style.map("Preset.TButton",
                   background=[("active", t["ACCENT"])],
@@ -208,19 +254,74 @@ class BikeSimApp(tk.Tk):
                         foreground=t["ERROR_FG"], background=t["BG"])
         style.configure("Treeview", background=t["ENTRY_BG"], foreground=t["FG"],
                         fieldbackground=t["ENTRY_BG"], font=_font_sm,
-                        rowheight=24)
+                        rowheight=26)
         style.configure("Treeview.Heading", background=t["SURFACE0"],
                         foreground=t["FG"], font=_font_bold)
         style.configure("Heading.TLabel", font=("Helvetica", 13, "bold"),
                         foreground=t["ACCENT"], background=t["BG"])
         style.configure("TSeparator", background=t["BORDER"])
-        style.configure("Card.TFrame", background=t["BG_LIGHT"])
+
+        # Card styles
+        style.configure("Card.TFrame", background=t["CARD_BG"])
+        style.configure("Card.TLabel", background=t["CARD_BG"], foreground=t["FG"])
+        style.configure("Card.TLabelframe", background=t["CARD_BG"],
+                        foreground=t["ACCENT"], borderwidth=1, relief="solid")
+        style.configure("Card.TLabelframe.Label", background=t["CARD_BG"],
+                        foreground=t["ACCENT"], font=_font_heading)
+
+        # Toolbar
+        style.configure("Toolbar.TFrame", background=t["TOOLBAR_BG"])
+        style.configure("Toolbar.TLabel", background=t["TOOLBAR_BG"],
+                        foreground=t["FG"])
+        style.configure("ToolbarTitle.TLabel", background=t["TOOLBAR_BG"],
+                        foreground=t["ACCENT"], font=_font_title)
+        style.configure("ToolbarVersion.TLabel", background=t["TOOLBAR_BG"],
+                        foreground=t["FG_DIM"], font=_font_sm)
+        style.configure("Toolbar.TButton", background=t["SURFACE0"],
+                        foreground=t["FG"], font=_font_sm, padding=(8, 4))
+        style.map("Toolbar.TButton",
+                  background=[("active", t["SURFACE1"])])
+
+        # Status bar
+        style.configure("Status.TFrame", background=t["STATUS_BG"])
+        style.configure("Status.TLabel", background=t["STATUS_BG"],
+                        foreground=t["FG_DIM"], font=_font_sm)
+        style.configure("StatusValue.TLabel", background=t["STATUS_BG"],
+                        foreground=t["FG"], font=("Helvetica", 10, "bold"))
+
+        # Dashboard metric cards
+        style.configure("MetricCard.TFrame", background=t["CARD_BG"])
+        style.configure("MetricValue.TLabel", background=t["CARD_BG"],
+                        foreground=t["ACCENT"], font=("Helvetica", 22, "bold"))
+        style.configure("MetricLabel.TLabel", background=t["CARD_BG"],
+                        foreground=t["FG_DIM"], font=_font_sm)
+        style.configure("MetricUnit.TLabel", background=t["CARD_BG"],
+                        foreground=t["FG_DIM"], font=("Helvetica", 10))
+
+        # Real-time specific
+        style.configure("RT.TFrame", background=t["BG"])
+        style.configure("RTMetric.TLabel", background=t["CARD_BG"],
+                        foreground=t["ACCENT2"], font=("Helvetica", 28, "bold"))
+        style.configure("RTLabel.TLabel", background=t["CARD_BG"],
+                        foreground=t["FG_DIM"], font=_font_sm)
+        style.configure("RTGrade.TLabel", background=t["CARD_BG"],
+                        foreground=t["ACCENT3"], font=("Helvetica", 16, "bold"))
+
+        # TProgressbar
+        style.configure("W.Horizontal.TProgressbar",
+                        background=t["ACCENT2"], troughcolor=t["GAUGE_TRACK"],
+                        borderwidth=0, lightcolor=t["ACCENT2"],
+                        darkcolor=t["ACCENT2"])
+        style.configure("Danger.Horizontal.TProgressbar",
+                        background=t["DANGER"], troughcolor=t["GAUGE_TRACK"],
+                        borderwidth=0, lightcolor=t["DANGER"],
+                        darkcolor=t["DANGER"])
 
     def _toggle_theme(self) -> None:
         self._theme = LIGHT if self._theme is DARK else DARK
         self._apply_theme()
         self._theme_btn.configure(
-            text="Dark Mode" if self._theme is LIGHT else "Light Mode"
+            text="\u263e Dark" if self._theme is LIGHT else "\u2600 Light"
         )
         self._run_simulation()
 
@@ -244,12 +345,20 @@ class BikeSimApp(tk.Tk):
         self.var_wheel_mass = tk.DoubleVar(value=1.8)
         self.var_ftp = tk.DoubleVar(value=250)
 
+        # Real-time simulation variables
+        self.var_rt_power = tk.DoubleVar(value=200)
+        self.var_rt_speed_mult = tk.DoubleVar(value=10.0)
+
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
     def _build_ui(self) -> None:
+        # Toolbar
+        self._build_toolbar()
+
+        # Main notebook
         self._notebook = ttk.Notebook(self)
-        self._notebook.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self._notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=(4, 0))
 
         self._build_main_tab()
         self._build_course_tab()
@@ -260,20 +369,147 @@ class BikeSimApp(tk.Tk):
         self._build_3d_tab()
         self._build_cp_tab()
         self._build_pacing_tab()
+        self._build_realtime_tab()
         self._build_export_tab()
+
+        # Status bar
+        self._build_status_bar()
+
+    def _build_toolbar(self) -> None:
+        toolbar = ttk.Frame(self, style="Toolbar.TFrame")
+        toolbar.pack(fill=tk.X, side=tk.TOP)
+
+        inner = ttk.Frame(toolbar, style="Toolbar.TFrame")
+        inner.pack(fill=tk.X, padx=12, pady=6)
+
+        ttk.Label(inner, text="\u26f2  Bike Power Simulator",
+                  style="ToolbarTitle.TLabel").pack(side=tk.LEFT)
+        ttk.Label(inner, text="  v6.0",
+                  style="ToolbarVersion.TLabel").pack(side=tk.LEFT, padx=(4, 0))
+
+        # Right side controls
+        right = ttk.Frame(inner, style="Toolbar.TFrame")
+        right.pack(side=tk.RIGHT)
+
+        self._theme_btn = ttk.Button(right, text="\u2600 Light",
+                                      style="Toolbar.TButton",
+                                      command=self._toggle_theme)
+        self._theme_btn.pack(side=tk.RIGHT, padx=4)
+
+        self._unit_btn = ttk.Button(right, text="\u21c4 Imperial",
+                                     style="Toolbar.TButton",
+                                     command=self._toggle_units)
+        self._unit_btn.pack(side=tk.RIGHT, padx=4)
+
+        ttk.Checkbutton(right, text="Auto-update",
+                        variable=self.var_auto_update,
+                        style="TCheckbutton").pack(side=tk.RIGHT, padx=8)
+
+    def _build_status_bar(self) -> None:
+        status = ttk.Frame(self, style="Status.TFrame")
+        status.pack(fill=tk.X, side=tk.BOTTOM)
+
+        inner = ttk.Frame(status, style="Status.TFrame")
+        inner.pack(fill=tk.X, padx=12, pady=4)
+
+        # Speed
+        ttk.Label(inner, text="Speed:", style="Status.TLabel").pack(side=tk.LEFT, padx=(0, 2))
+        self._status_speed = ttk.Label(inner, text="0.0 km/h", style="StatusValue.TLabel")
+        self._status_speed.pack(side=tk.LEFT, padx=(0, 16))
+
+        # Separator
+        ttk.Label(inner, text="\u2502", style="Status.TLabel").pack(side=tk.LEFT, padx=4)
+
+        # Power Zone
+        ttk.Label(inner, text="Zone:", style="Status.TLabel").pack(side=tk.LEFT, padx=(4, 2))
+        self._status_zone = ttk.Label(inner, text="Z2 Endurance", style="StatusValue.TLabel")
+        self._status_zone.pack(side=tk.LEFT, padx=(0, 16))
+
+        ttk.Label(inner, text="\u2502", style="Status.TLabel").pack(side=tk.LEFT, padx=4)
+
+        # W/kg
+        ttk.Label(inner, text="W/kg:", style="Status.TLabel").pack(side=tk.LEFT, padx=(4, 2))
+        self._status_wkg = ttk.Label(inner, text="0.00", style="StatusValue.TLabel")
+        self._status_wkg.pack(side=tk.LEFT, padx=(0, 16))
+
+        ttk.Label(inner, text="\u2502", style="Status.TLabel").pack(side=tk.LEFT, padx=4)
+
+        # Calories
+        ttk.Label(inner, text="Cal/hr:", style="Status.TLabel").pack(side=tk.LEFT, padx=(4, 2))
+        self._status_cal = ttk.Label(inner, text="0", style="StatusValue.TLabel")
+        self._status_cal.pack(side=tk.LEFT, padx=(0, 16))
+
+        # Right side: timestamp
+        self._status_time = ttk.Label(inner, text="", style="Status.TLabel")
+        self._status_time.pack(side=tk.RIGHT, padx=4)
+
+    def _update_status_bar(self, result: SimulationResult, rider: RiderParams) -> None:
+        speed_text = f"{result.speed_mph:.1f} mph" if self._imperial else f"{result.speed_kmh:.1f} km/h"
+        self._status_speed.configure(text=speed_text)
+
+        ftp = self.var_ftp.get()
+        zone_name, _ = zone_for_power(rider.power_watts, ftp)
+        self._status_zone.configure(text=zone_name)
+
+        w_kg = power_to_weight_ratio(ftp, rider.weight_kg)
+        cat = classify_rider(w_kg)
+        self._status_wkg.configure(text=f"{w_kg:.2f} ({cat})")
+
+        cal_hr = estimate_calories(rider.power_watts, 3600)
+        self._status_cal.configure(text=f"{cal_hr:.0f} kcal")
+
+        now = datetime.datetime.now().strftime("%H:%M:%S")
+        self._status_time.configure(text=now)
+
+    # ------------------------------------------------------------------
+    # Card frame helper
+    # ------------------------------------------------------------------
+    def _make_card(self, parent: tk.Widget, title: str = "",
+                   padx: int = 8, pady: int = 4) -> ttk.Frame:
+        """Create a card-style frame with optional title."""
+        if title:
+            card = ttk.LabelFrame(parent, text=title, style="Card.TLabelframe")
+        else:
+            card = ttk.Frame(parent, style="Card.TFrame")
+        card.pack(fill=tk.X, padx=padx, pady=pady)
+        return card
+
+    def _make_metric_card(self, parent: tk.Widget, label: str, value: str,
+                          unit: str = "") -> dict[str, ttk.Label]:
+        """Create a dashboard metric card and return references."""
+        card = ttk.Frame(parent, style="MetricCard.TFrame")
+        card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=4)
+
+        inner = ttk.Frame(card, style="MetricCard.TFrame")
+        inner.pack(padx=12, pady=8)
+
+        lbl = ttk.Label(inner, text=label, style="MetricLabel.TLabel")
+        lbl.pack(anchor=tk.W)
+
+        val_frame = ttk.Frame(inner, style="MetricCard.TFrame")
+        val_frame.pack(anchor=tk.W)
+
+        val_lbl = ttk.Label(val_frame, text=value, style="MetricValue.TLabel")
+        val_lbl.pack(side=tk.LEFT)
+
+        unit_lbl = ttk.Label(val_frame, text=f" {unit}" if unit else "",
+                             style="MetricUnit.TLabel")
+        unit_lbl.pack(side=tk.LEFT, anchor=tk.S, pady=(0, 2))
+
+        return {"label": lbl, "value": val_lbl, "unit": unit_lbl, "card": card}
 
     # ==================================================================
     # TAB 1: Main Simulation
     # ==================================================================
     def _build_main_tab(self) -> None:
         tab = ttk.Frame(self._notebook)
-        self._notebook.add(tab, text="  Simulation  ")
+        self._notebook.add(tab, text="  \u26a1 Simulation  ")
 
         left = ttk.Frame(tab)
-        left.pack(side=tk.LEFT, fill=tk.BOTH, padx=(4, 4))
+        left.pack(side=tk.LEFT, fill=tk.BOTH, padx=(6, 3))
 
         right = ttk.Frame(tab)
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(4, 4))
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(3, 6))
 
         self.lbl_error = ttk.Label(left, text="", style="Error.TLabel", wraplength=280)
         self.lbl_error.pack(fill=tk.X, pady=(0, 2))
@@ -287,10 +523,10 @@ class BikeSimApp(tk.Tk):
         self._build_charts(right)
 
     def _build_preset_bar(self, parent: tk.Widget) -> None:
-        frame = ttk.LabelFrame(parent, text="Presets")
+        frame = ttk.LabelFrame(parent, text="\u2b50 Presets", style="Card.TLabelframe")
         frame.pack(fill=tk.X, pady=(0, 6))
-        inner = ttk.Frame(frame)
-        inner.pack(fill=tk.X, padx=6, pady=4)
+        inner = ttk.Frame(frame, style="Card.TFrame")
+        inner.pack(fill=tk.X, padx=8, pady=4)
 
         all_presets = PRESETS + self._custom_presets
         for i, preset in enumerate(all_presets):
@@ -302,8 +538,8 @@ class BikeSimApp(tk.Tk):
         inner.columnconfigure(0, weight=1)
         inner.columnconfigure(1, weight=1)
 
-        btn_row = ttk.Frame(frame)
-        btn_row.pack(fill=tk.X, padx=6, pady=(0, 4))
+        btn_row = ttk.Frame(frame, style="Card.TFrame")
+        btn_row.pack(fill=tk.X, padx=8, pady=(0, 6))
         ttk.Button(btn_row, text="Save Preset", style="Preset.TButton",
                    command=self._save_current_preset).pack(side=tk.LEFT, padx=2)
         ttk.Button(btn_row, text="Load Presets", style="Preset.TButton",
@@ -312,101 +548,102 @@ class BikeSimApp(tk.Tk):
                    command=self._export_presets_file).pack(side=tk.LEFT, padx=2)
 
     def _build_rider_section(self, parent: tk.Widget) -> None:
-        frame = ttk.LabelFrame(parent, text="Rider")
+        frame = ttk.LabelFrame(parent, text="\U0001f6b4 Rider", style="Card.TLabelframe")
         frame.pack(fill=tk.X, pady=(0, 6))
-        self._add_slider(frame, "Power (W)", self.var_power, 0, 1500, 1)
-        self._add_slider(frame, "Weight (kg)", self.var_rider_weight, 30, 150, 0.5)
-        self._add_slider(frame, "Height (cm)", self.var_rider_height, 140, 210, 1)
-        self._add_slider(frame, "FTP (W)", self.var_ftp, 50, 500, 5)
+        self._add_slider(frame, "Power", self.var_power, 0, 1500, 1, "W")
+        self._add_slider(frame, "Weight", self.var_rider_weight, 30, 150, 0.5, "kg")
+        self._add_slider(frame, "Height", self.var_rider_height, 140, 210, 1, "cm")
+        self._add_slider(frame, "FTP", self.var_ftp, 50, 500, 5, "W")
 
     def _build_bike_section(self, parent: tk.Widget) -> None:
-        frame = ttk.LabelFrame(parent, text="Bike")
+        frame = ttk.LabelFrame(parent, text="\U0001f6b2 Bike", style="Card.TLabelframe")
         frame.pack(fill=tk.X, pady=(0, 6))
-        self._add_slider(frame, "Bike Weight (kg)", self.var_bike_weight, 3, 25, 0.1)
+        self._add_slider(frame, "Bike Weight", self.var_bike_weight, 3, 25, 0.1, "kg")
 
-        row = ttk.Frame(frame)
-        row.pack(fill=tk.X, padx=8, pady=2)
-        _label(row, "Tire Type:").pack(side=tk.LEFT)
+        row = ttk.Frame(frame, style="Card.TFrame")
+        row.pack(fill=tk.X, padx=10, pady=3)
+        _label(row, "Tire Type:", style="Card.TLabel").pack(side=tk.LEFT)
         ttk.Combobox(row, textvariable=self.var_tire,
                      values=[t.value for t in TireType],
                      state="readonly", width=18).pack(side=tk.RIGHT)
 
-        row2 = ttk.Frame(frame)
-        row2.pack(fill=tk.X, padx=8, pady=2)
-        _label(row2, "Position:").pack(side=tk.LEFT)
+        row2 = ttk.Frame(frame, style="Card.TFrame")
+        row2.pack(fill=tk.X, padx=10, pady=3)
+        _label(row2, "Position:", style="Card.TLabel").pack(side=tk.LEFT)
         ttk.Combobox(row2, textvariable=self.var_position,
                      values=[p.value for p in RidingPosition],
                      state="readonly", width=18).pack(side=tk.RIGHT)
 
-        self._add_slider(frame, "Drivetrain Eff. (%)", self.var_efficiency, 85, 100, 0.5)
-        self._add_slider(frame, "Wheel Mass (kg)", self.var_wheel_mass, 0.5, 4.0, 0.1)
+        self._add_slider(frame, "Drivetrain Eff.", self.var_efficiency, 85, 100, 0.5, "%")
+        self._add_slider(frame, "Wheel Mass", self.var_wheel_mass, 0.5, 4.0, 0.1, "kg")
 
     def _build_course_section(self, parent: tk.Widget) -> None:
-        frame = ttk.LabelFrame(parent, text="Course / Environment")
+        frame = ttk.LabelFrame(parent, text="\U0001f3d4 Course / Environment",
+                               style="Card.TLabelframe")
         frame.pack(fill=tk.X, pady=(0, 6))
-        self._add_slider(frame, "Grade (%)", self.var_grade, -20, 25, 0.1)
-        self._add_slider(frame, "Wind Speed (km/h)", self.var_wind, 0, 80, 1)
-        self._add_slider(frame, "Wind Dir (0=head 180=tail)", self.var_wind_dir, 0, 360, 5)
-        self._add_slider(frame, "Elevation (m)", self.var_elevation, 0, 5000, 10)
-        self._add_slider(frame, "Temperature (\u00b0C)", self.var_temperature, -10, 50, 1)
+        self._add_slider(frame, "Grade", self.var_grade, -20, 25, 0.1, "%")
+        self._add_slider(frame, "Wind Speed", self.var_wind, 0, 80, 1, "km/h")
+        self._add_slider(frame, "Wind Dir", self.var_wind_dir, 0, 360, 5, "\u00b0")
+        self._add_slider(frame, "Elevation", self.var_elevation, 0, 5000, 10, "m")
+        self._add_slider(frame, "Temperature", self.var_temperature, -10, 50, 1, "\u00b0C")
 
     def _build_controls(self, parent: tk.Widget) -> None:
         frame = ttk.Frame(parent)
-        frame.pack(fill=tk.X, pady=(4, 0))
-        ttk.Checkbutton(frame, text="Auto-update",
-                        variable=self.var_auto_update).pack(side=tk.LEFT, padx=4)
-        ttk.Button(frame, text="Calculate",
+        frame.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(frame, text="\u25b6 Calculate",
                    command=self._run_simulation).pack(side=tk.RIGHT, padx=4)
 
-        frame2 = ttk.Frame(parent)
-        frame2.pack(fill=tk.X, pady=(4, 0))
-        self._unit_btn = ttk.Button(frame2, text="Switch to Imperial",
-                                     command=self._toggle_units)
-        self._unit_btn.pack(side=tk.LEFT, padx=4)
-        self._theme_btn = ttk.Button(frame2, text="Light Mode",
-                                      command=self._toggle_theme)
-        self._theme_btn.pack(side=tk.LEFT, padx=4)
-
     def _build_results(self, parent: tk.Widget) -> None:
-        frame = ttk.Frame(parent)
-        frame.pack(fill=tk.X, pady=(0, 4))
+        # Dashboard metric cards row
+        dashboard = ttk.Frame(parent)
+        dashboard.pack(fill=tk.X, pady=(0, 4))
 
-        self.lbl_speed_primary = ttk.Label(frame, text="0.0", style="Result.TLabel")
-        self.lbl_speed_primary.pack(side=tk.LEFT, padx=(8, 0))
-        self.lbl_speed_unit1 = ttk.Label(frame, text="km/h", style="ResultUnit.TLabel")
-        self.lbl_speed_unit1.pack(side=tk.LEFT, anchor=tk.S, pady=(0, 6))
+        # Speed display (large)
+        speed_card = ttk.Frame(dashboard, style="MetricCard.TFrame")
+        speed_card.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=4, pady=4)
+        inner_sp = ttk.Frame(speed_card, style="MetricCard.TFrame")
+        inner_sp.pack(padx=12, pady=8)
+        ttk.Label(inner_sp, text="SPEED", style="MetricLabel.TLabel").pack(anchor=tk.W)
+        sp_row = ttk.Frame(inner_sp, style="MetricCard.TFrame")
+        sp_row.pack(anchor=tk.W)
+        self.lbl_speed_primary = ttk.Label(sp_row, text="0.0", style="Result.TLabel")
+        self.lbl_speed_primary.configure(background=self._theme["CARD_BG"])
+        self.lbl_speed_primary.pack(side=tk.LEFT)
+        self.lbl_speed_unit1 = ttk.Label(sp_row, text="km/h",
+                                         style="ResultUnit.TLabel")
+        self.lbl_speed_unit1.configure(background=self._theme["CARD_BG"])
+        self.lbl_speed_unit1.pack(side=tk.LEFT, anchor=tk.S, pady=(0, 8))
 
-        ttk.Label(frame, text="  |  ", style="ResultUnit.TLabel").pack(
-            side=tk.LEFT, anchor=tk.S, pady=(0, 6))
-
-        self.lbl_speed_secondary = ttk.Label(frame, text="0.0", style="Result.TLabel")
+        sp_row2 = ttk.Frame(inner_sp, style="MetricCard.TFrame")
+        sp_row2.pack(anchor=tk.W)
+        self.lbl_speed_secondary = ttk.Label(sp_row2, text="0.0",
+                                              font=("Helvetica", 16),
+                                              foreground=self._theme["FG_DIM"],
+                                              background=self._theme["CARD_BG"])
         self.lbl_speed_secondary.pack(side=tk.LEFT)
-        self.lbl_speed_unit2 = ttk.Label(frame, text="mph", style="ResultUnit.TLabel")
-        self.lbl_speed_unit2.pack(side=tk.LEFT, anchor=tk.S, pady=(0, 6))
+        self.lbl_speed_unit2 = ttk.Label(sp_row2, text=" mph",
+                                          font=("Helvetica", 11),
+                                          foreground=self._theme["FG_DIM"],
+                                          background=self._theme["CARD_BG"])
+        self.lbl_speed_unit2.pack(side=tk.LEFT, anchor=tk.S, pady=(0, 2))
 
-        # Calories display
-        self.lbl_calories = ttk.Label(frame, text="", style="Small.TLabel")
-        self.lbl_calories.pack(side=tk.RIGHT, padx=8)
+        # Right-side metric cards
+        self._metric_zone = self._make_metric_card(dashboard, "POWER ZONE", "Z2", "")
+        self._metric_wkg = self._make_metric_card(dashboard, "W/KG", "0.00", "")
+        self._metric_cal = self._make_metric_card(dashboard, "CALORIES", "0", "kcal/hr")
 
-        # W/kg display
-        self.lbl_wkg = ttk.Label(frame, text="", style="Small.TLabel")
-        self.lbl_wkg.pack(side=tk.RIGHT, padx=8)
-
-        # Power zone display
-        self.lbl_zone = ttk.Label(frame, text="", style="Small.TLabel")
-        self.lbl_zone.pack(side=tk.RIGHT, padx=8)
-
+        # Details row
         detail_frame = ttk.Frame(parent)
         detail_frame.pack(fill=tk.X, padx=8, pady=(0, 4))
         self.lbl_details = ttk.Label(detail_frame, text="", style="Small.TLabel",
-                                     wraplength=600, justify=tk.LEFT)
+                                     wraplength=700, justify=tk.LEFT)
         self.lbl_details.pack(anchor=tk.W)
 
     def _build_charts(self, parent: tk.Widget) -> None:
         t = self._theme
-        self.fig = Figure(figsize=(7, 5), dpi=100, facecolor=t["BG"])
-        self.fig.subplots_adjust(hspace=0.45, left=0.10, right=0.95,
-                                 top=0.94, bottom=0.10)
+        self.fig = Figure(figsize=(7, 4.5), dpi=100, facecolor=t["BG"])
+        self.fig.subplots_adjust(hspace=0.50, left=0.10, right=0.95,
+                                 top=0.93, bottom=0.10)
         self.ax_curve = self.fig.add_subplot(211)
         self.ax_pie = self.fig.add_subplot(212)
         self.canvas = FigureCanvasTkAgg(self.fig, master=parent)
@@ -417,7 +654,7 @@ class BikeSimApp(tk.Tk):
     # ==================================================================
     def _build_course_tab(self) -> None:
         tab = ttk.Frame(self._notebook)
-        self._notebook.add(tab, text="  Course Profile  ")
+        self._notebook.add(tab, text="  \U0001f4c8 Course Profile  ")
 
         left = ttk.Frame(tab)
         left.pack(side=tk.LEFT, fill=tk.BOTH, padx=8, pady=4)
@@ -425,36 +662,37 @@ class BikeSimApp(tk.Tk):
         right = ttk.Frame(tab)
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=4)
 
-        seg_frame = ttk.LabelFrame(left, text="Course Segments")
+        seg_frame = ttk.LabelFrame(left, text="Course Segments", style="Card.TLabelframe")
         seg_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
 
-        btn_row = ttk.Frame(seg_frame)
-        btn_row.pack(fill=tk.X, padx=4, pady=4)
-        ttk.Button(btn_row, text="Add Segment", style="Preset.TButton",
+        btn_row = ttk.Frame(seg_frame, style="Card.TFrame")
+        btn_row.pack(fill=tk.X, padx=6, pady=4)
+        ttk.Button(btn_row, text="+ Segment", style="Preset.TButton",
                    command=self._add_course_segment).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_row, text="Remove Last", style="Preset.TButton",
+        ttk.Button(btn_row, text="\u2212 Last", style="Preset.TButton",
                    command=self._remove_course_segment).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_row, text="Move Up", style="Preset.TButton",
+        ttk.Button(btn_row, text="\u25b2", style="Preset.TButton",
                    command=self._move_segment_up).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_row, text="Move Down", style="Preset.TButton",
+        ttk.Button(btn_row, text="\u25bc", style="Preset.TButton",
                    command=self._move_segment_down).pack(side=tk.LEFT, padx=2)
 
-        btn_row2 = ttk.Frame(seg_frame)
-        btn_row2.pack(fill=tk.X, padx=4, pady=2)
+        btn_row2 = ttk.Frame(seg_frame, style="Card.TFrame")
+        btn_row2.pack(fill=tk.X, padx=6, pady=2)
         ttk.Button(btn_row2, text="Import GPX", style="Preset.TButton",
                    command=self._import_gpx).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_row2, text="Run Profile",
+        ttk.Button(btn_row2, text="\u25b6 Run Profile",
                    command=self._run_course_profile).pack(side=tk.RIGHT, padx=2)
-        ttk.Button(btn_row2, text="Animate", style="Preset.TButton",
+        ttk.Button(btn_row2, text="\u25b6 Animate", style="Preset.TButton",
                    command=self._animate_course).pack(side=tk.RIGHT, padx=2)
 
-        # Segment listbox for selection (for move up/down)
         self._seg_listbox = tk.Listbox(seg_frame, bg=self._theme["ENTRY_BG"],
                                         fg=self._theme["FG"], height=12,
-                                        selectmode=tk.SINGLE, font=("Segoe UI", 9))
-        self._seg_listbox.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+                                        selectmode=tk.SINGLE, font=("Helvetica", 9),
+                                        relief="flat", bd=0,
+                                        highlightthickness=1,
+                                        highlightcolor=self._theme["ACCENT"])
+        self._seg_listbox.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
 
-        # Add default segments
         for grade in [0, 5, -3]:
             self._add_course_segment(grade=grade)
 
@@ -471,55 +709,56 @@ class BikeSimApp(tk.Tk):
         self.canvas_course = FigureCanvasTkAgg(self.fig_course, master=right)
         self.canvas_course.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-    def _add_course_segment(self, grade: float = 0.0, distance: float = 1000.0,
-                             wind: float = 0.0, elev: float = 100.0,
-                             temp: float = 20.0) -> None:
+    def _add_course_segment(self, distance: float = 1000,
+                            grade: float = 0, wind: float = 0,
+                            wind_dir: float = 0, elevation: float = 100,
+                            temperature: float = 20) -> None:
         seg_vars: dict[str, tk.DoubleVar] = {
             "distance": tk.DoubleVar(value=distance),
             "grade": tk.DoubleVar(value=grade),
             "wind": tk.DoubleVar(value=wind),
-            "wind_dir": tk.DoubleVar(value=0),
-            "elevation": tk.DoubleVar(value=elev),
-            "temperature": tk.DoubleVar(value=temp),
+            "wind_dir": tk.DoubleVar(value=wind_dir),
+            "elevation": tk.DoubleVar(value=elevation),
+            "temperature": tk.DoubleVar(value=temperature),
         }
         self._course_segments.append(seg_vars)
         self._refresh_seg_listbox()
 
     def _remove_course_segment(self) -> None:
-        sel = self._seg_listbox.curselection()
-        if sel:
-            idx = sel[0]
-            self._course_segments.pop(idx)
-        elif self._course_segments:
+        if self._course_segments:
             self._course_segments.pop()
-        self._refresh_seg_listbox()
-
-    def _move_segment_up(self) -> None:
-        sel = self._seg_listbox.curselection()
-        if not sel or sel[0] == 0:
-            return
-        idx = sel[0]
-        self._course_segments[idx], self._course_segments[idx - 1] = \
-            self._course_segments[idx - 1], self._course_segments[idx]
-        self._refresh_seg_listbox()
-        self._seg_listbox.selection_set(idx - 1)
-
-    def _move_segment_down(self) -> None:
-        sel = self._seg_listbox.curselection()
-        if not sel or sel[0] >= len(self._course_segments) - 1:
-            return
-        idx = sel[0]
-        self._course_segments[idx], self._course_segments[idx + 1] = \
-            self._course_segments[idx + 1], self._course_segments[idx]
-        self._refresh_seg_listbox()
-        self._seg_listbox.selection_set(idx + 1)
+            self._refresh_seg_listbox()
 
     def _refresh_seg_listbox(self) -> None:
         self._seg_listbox.delete(0, tk.END)
         for i, sv in enumerate(self._course_segments):
             d = sv["distance"].get()
             g = sv["grade"].get()
-            self._seg_listbox.insert(tk.END, f"Seg {i+1}: {d:.0f}m @ {g:.1f}%")
+            self._seg_listbox.insert(
+                tk.END,
+                f"  Seg {i+1}: {d:.0f}m  |  {g:+.1f}%  |  "
+                f"wind {sv['wind'].get():.0f} km/h"
+            )
+
+    def _move_segment_up(self) -> None:
+        sel = self._seg_listbox.curselection()
+        if sel and sel[0] > 0:
+            idx = sel[0]
+            self._course_segments[idx - 1], self._course_segments[idx] = (
+                self._course_segments[idx], self._course_segments[idx - 1]
+            )
+            self._refresh_seg_listbox()
+            self._seg_listbox.selection_set(idx - 1)
+
+    def _move_segment_down(self) -> None:
+        sel = self._seg_listbox.curselection()
+        if sel and sel[0] < len(self._course_segments) - 1:
+            idx = sel[0]
+            self._course_segments[idx], self._course_segments[idx + 1] = (
+                self._course_segments[idx + 1], self._course_segments[idx]
+            )
+            self._refresh_seg_listbox()
+            self._seg_listbox.selection_set(idx + 1)
 
     def _import_gpx(self) -> None:
         path = filedialog.askopenfilename(filetypes=[("GPX files", "*.gpx")])
@@ -528,14 +767,17 @@ class BikeSimApp(tk.Tk):
         try:
             segments = parse_gpx(path)
             if not segments:
-                messagebox.showwarning("GPX", "No trackpoints found in file.")
+                messagebox.showwarning("GPX", "No segments found in the file.")
                 return
             self._course_segments.clear()
             for seg in segments:
                 self._add_course_segment(
-                    grade=seg.grade_pct, distance=seg.distance_m,
-                    elev=seg.elevation_m, temp=seg.temperature_c)
-            messagebox.showinfo("GPX", f"Imported {len(segments)} segments from GPX.")
+                    distance=seg.distance_m, grade=seg.grade_pct,
+                    wind=seg.headwind_kmh, wind_dir=seg.wind_direction_deg,
+                    elevation=seg.elevation_m, temperature=seg.temperature_c,
+                )
+            messagebox.showinfo("GPX Loaded",
+                                f"Loaded {len(segments)} segments from GPX.")
         except Exception as e:
             messagebox.showerror("GPX Error", str(e))
 
@@ -553,8 +795,7 @@ class BikeSimApp(tk.Tk):
                     temperature_c=sv["temperature"].get(),
                 ))
             except (tk.TclError, ValueError):
-                messagebox.showerror("Input Error", "Invalid values in segment")
-                return
+                pass
 
         if not segments:
             messagebox.showwarning("No Segments", "Add at least one course segment.")
@@ -571,10 +812,10 @@ class BikeSimApp(tk.Tk):
         mins = int(result.total_time_s // 60)
         secs = int(result.total_time_s % 60)
         summary = (
-            f"Total: {result.total_distance_m / 1000:.2f} km  |  "
+            f"Total: {result.total_distance_m / 1000:.2f} km  \u2502  "
             f"Time: {mins}:{secs:02d}\n"
             f"Avg Speed: {result.avg_speed_kmh:.1f} km/h\n"
-            f"Elev Gain: {result.total_elevation_gain_m:.0f} m  |  "
+            f"Elev Gain: {result.total_elevation_gain_m:.0f} m  \u2502  "
             f"Loss: {result.total_elevation_loss_m:.0f} m\n"
             f"Est. Calories: {total_cal:.0f} kcal"
         )
@@ -592,7 +833,7 @@ class BikeSimApp(tk.Tk):
                          for i in range(len(result.speeds))]
         ax1.bar(mid_distances, result.speeds, width=[
             distances_km[i + 1] - distances_km[i] for i in range(len(result.speeds))
-        ], color=t["ACCENT"], alpha=0.8, edgecolor=t["BORDER"])
+        ], color=t["ACCENT"], alpha=0.8, edgecolor=t["BORDER"], linewidth=0.5)
         ax1.axhline(result.avg_speed_kmh, color=t["ACCENT4"], linestyle="--",
                     linewidth=1, label=f"Avg: {result.avg_speed_kmh:.1f} km/h")
         ax1.set_xlabel("Distance (km)", color=t["FG"], fontsize=9)
@@ -645,7 +886,7 @@ class BikeSimApp(tk.Tk):
     # ==================================================================
     def _build_workout_tab(self) -> None:
         tab = ttk.Frame(self._notebook)
-        self._notebook.add(tab, text="  Workout  ")
+        self._notebook.add(tab, text="  \U0001f3cb Workout  ")
 
         left = ttk.Frame(tab)
         left.pack(side=tk.LEFT, fill=tk.BOTH, padx=8, pady=4, expand=False)
@@ -653,24 +894,25 @@ class BikeSimApp(tk.Tk):
         right = ttk.Frame(tab)
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=4)
 
-        intv_frame = ttk.LabelFrame(left, text="Interval Steps")
+        intv_frame = ttk.LabelFrame(left, text="Interval Steps", style="Card.TLabelframe")
         intv_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
 
-        btn_row = ttk.Frame(intv_frame)
-        btn_row.pack(fill=tk.X, padx=4, pady=4)
-        ttk.Button(btn_row, text="Add Step", style="Preset.TButton",
+        btn_row = ttk.Frame(intv_frame, style="Card.TFrame")
+        btn_row.pack(fill=tk.X, padx=6, pady=4)
+        ttk.Button(btn_row, text="+ Step", style="Preset.TButton",
                    command=self._add_interval_step).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_row, text="Remove Last", style="Preset.TButton",
+        ttk.Button(btn_row, text="\u2212 Last", style="Preset.TButton",
                    command=self._remove_interval_step).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_row, text="Run Workout",
+        ttk.Button(btn_row, text="\u25b6 Run Workout",
                    command=self._run_workout).pack(side=tk.RIGHT, padx=2)
 
         self._intv_listbox = tk.Listbox(intv_frame, bg=self._theme["ENTRY_BG"],
                                          fg=self._theme["FG"], height=8,
-                                         font=("Segoe UI", 9))
-        self._intv_listbox.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+                                         font=("Helvetica", 9), relief="flat", bd=0,
+                                         highlightthickness=1,
+                                         highlightcolor=self._theme["ACCENT"])
+        self._intv_listbox.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
 
-        # Default workout: warmup / interval / recovery / interval / cooldown
         for pw, dur in [(150, 300), (300, 180), (150, 120), (350, 180), (100, 300)]:
             self._add_interval_step(power=pw, duration=dur)
 
@@ -709,7 +951,7 @@ class BikeSimApp(tk.Tk):
             secs = int(dur % 60)
             zone_name, _ = zone_for_power(pw, self.var_ftp.get())
             self._intv_listbox.insert(tk.END,
-                f"Step {i+1}: {pw:.0f}W x {mins}:{secs:02d} ({zone_name})")
+                f"  Step {i+1}: {pw:.0f}W \u00d7 {mins}:{secs:02d} ({zone_name})")
 
     def _run_workout(self) -> None:
         rider, bike, course = self._gather_params()
@@ -753,13 +995,11 @@ class BikeSimApp(tk.Tk):
         ax1.clear()
         _style_ax(ax1, t)
 
-        # Zone background bands
         for name, lo, hi, color in zones:
             if hi > 3000:
                 hi = max(powers) * 1.1 if powers else 500
             ax1.axhspan(lo, hi, alpha=0.10, color=color)
 
-        # Color each point by zone
         for i in range(len(times_min) - 1):
             _, color = zone_for_power(powers[i], ftp)
             ax1.fill_between(
@@ -788,46 +1028,44 @@ class BikeSimApp(tk.Tk):
     # ==================================================================
     def _build_compare_tab(self) -> None:
         tab = ttk.Frame(self._notebook)
-        self._notebook.add(tab, text="  Compare  ")
+        self._notebook.add(tab, text="  \u2696 Compare  ")
 
         top = ttk.Frame(tab)
         top.pack(fill=tk.X, padx=8, pady=4)
 
-        ttk.Button(top, text="Add Current as Scenario",
-                   command=self._add_scenario).pack(side=tk.LEFT, padx=4)
-        ttk.Button(top, text="Clear All",
+        ttk.Button(top, text="Snapshot Current Config",
+                   command=self._snapshot_scenario).pack(side=tk.LEFT, padx=4)
+        ttk.Button(top, text="Clear All", style="Secondary.TButton",
                    command=self._clear_scenarios).pack(side=tk.LEFT, padx=4)
-        ttk.Button(top, text="Export Comparison CSV",
-                   command=self._export_comparison).pack(side=tk.RIGHT, padx=4)
 
-        cols = ("Name", "Power", "Weight", "Grade", "Wind", "Speed (km/h)", "Speed (mph)")
-        self._compare_tree = ttk.Treeview(tab, columns=cols, show="headings", height=8)
-        for col in cols:
-            self._compare_tree.heading(col, text=col)
-            self._compare_tree.column(col, width=100, anchor=tk.CENTER)
+        self._compare_tree = ttk.Treeview(
+            tab, columns=("power", "weight", "grade", "wind", "speed"),
+            show="headings", height=6,
+        )
+        for col, hd, w in [("power", "Power (W)", 80), ("weight", "Weight (kg)", 80),
+                           ("grade", "Grade (%)", 80), ("wind", "Wind (km/h)", 80),
+                           ("speed", "Speed (km/h)", 100)]:
+            self._compare_tree.heading(col, text=hd)
+            self._compare_tree.column(col, width=w, anchor=tk.CENTER)
         self._compare_tree.pack(fill=tk.X, padx=8, pady=4)
 
         t = self._theme
-        self.fig_compare = Figure(figsize=(7, 3), dpi=100, facecolor=t["BG"])
-        self.fig_compare.subplots_adjust(left=0.10, right=0.95, top=0.90, bottom=0.20)
+        self.fig_compare = Figure(figsize=(7, 4), dpi=100, facecolor=t["BG"])
+        self.fig_compare.subplots_adjust(left=0.10, right=0.95, top=0.92, bottom=0.18)
         self.ax_compare = self.fig_compare.add_subplot(111)
         self.canvas_compare = FigureCanvasTkAgg(self.fig_compare, master=tab)
         self.canvas_compare.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8)
 
-    def _add_scenario(self) -> None:
+    def _snapshot_scenario(self) -> None:
         rider, bike, course = self._gather_params()
         result = solve_speed(rider, bike, course)
         name = f"Scenario {len(self._scenarios) + 1}"
         self._scenarios.append((name, rider, bike, course, result))
 
         self._compare_tree.insert("", tk.END, values=(
-            name,
-            f"{rider.power_watts:.0f} W",
-            f"{rider.weight_kg + bike.weight_kg:.1f} kg",
-            f"{course.grade_pct:.1f}%",
-            f"{course.headwind_kmh:.0f} km/h",
+            f"{rider.power_watts:.0f}", f"{rider.weight_kg:.1f}",
+            f"{course.grade_pct:.1f}", f"{course.headwind_kmh:.0f}",
             f"{result.speed_kmh:.1f}",
-            f"{result.speed_mph:.1f}",
         ))
         self._update_compare_chart()
 
@@ -844,16 +1082,13 @@ class BikeSimApp(tk.Tk):
         ax.clear()
         _style_ax(ax, t)
 
-        if not self._scenarios:
-            self.canvas_compare.draw_idle()
-            return
-
         chart_colors = [t[k] for k in CHART_COLOURS_KEYS]
         names = [s[0] for s in self._scenarios]
         speeds = [s[4].speed_kmh for s in self._scenarios]
         colors = [chart_colors[i % len(chart_colors)] for i in range(len(names))]
 
-        bars = ax.bar(names, speeds, color=colors, edgecolor=t["BORDER"], alpha=0.85)
+        bars = ax.bar(names, speeds, color=colors, edgecolor=t["BORDER"],
+                      alpha=0.85, width=0.6)
         for bar, spd in zip(bars, speeds):
             ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
                     f"{spd:.1f}", ha="center", va="bottom", color=t["FG"], fontsize=8)
@@ -863,22 +1098,12 @@ class BikeSimApp(tk.Tk):
 
         self.canvas_compare.draw_idle()
 
-    def _export_comparison(self) -> None:
-        if not self._scenarios:
-            messagebox.showwarning("No Data", "Add scenarios before exporting.")
-            return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".csv", filetypes=[("CSV", "*.csv")])
-        if path:
-            export_comparison_csv(self._scenarios, path)
-            messagebox.showinfo("Exported", f"Comparison saved to {path}")
-
     # ==================================================================
-    # TAB 5: Power-to-Weight Ratio Analysis
+    # TAB 5: W/kg Analysis
     # ==================================================================
     def _build_pw_ratio_tab(self) -> None:
         tab = ttk.Frame(self._notebook)
-        self._notebook.add(tab, text="  W/kg Analysis  ")
+        self._notebook.add(tab, text="  \U0001f4aa W/kg  ")
 
         left = ttk.Frame(tab)
         left.pack(side=tk.LEFT, fill=tk.BOTH, padx=8, pady=4)
@@ -886,36 +1111,33 @@ class BikeSimApp(tk.Tk):
         right = ttk.Frame(tab)
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=4)
 
-        info_frame = ttk.LabelFrame(left, text="Your Power-to-Weight")
-        info_frame.pack(fill=tk.X, pady=(0, 6))
+        info = ttk.LabelFrame(left, text="Power-to-Weight Analysis",
+                               style="Card.TLabelframe")
+        info.pack(fill=tk.X, pady=(0, 6))
 
-        ttk.Button(info_frame, text="Analyze Current Settings",
-                   command=self._run_pw_analysis).pack(fill=tk.X, padx=8, pady=4)
+        ttk.Button(info, text="Analyze Current Settings",
+                   command=self._run_pw_analysis).pack(fill=tk.X, padx=8, pady=6)
 
-        self.lbl_pw_ratio = ttk.Label(info_frame, text="", style="Result.TLabel")
-        self.lbl_pw_ratio.pack(padx=8, pady=4)
-        self.lbl_pw_unit = ttk.Label(info_frame, text="W/kg", style="ResultUnit.TLabel")
-        self.lbl_pw_unit.pack(padx=8)
+        res_card = ttk.Frame(info, style="MetricCard.TFrame")
+        res_card.pack(fill=tk.X, padx=8, pady=(0, 6))
 
-        self.lbl_pw_category = ttk.Label(info_frame, text="",
-                                          font=("Segoe UI", 14, "bold"))
-        self.lbl_pw_category.pack(padx=8, pady=8)
+        ttk.Label(res_card, text="W/kg Ratio:", style="Card.TLabel").pack(padx=8, anchor=tk.W, pady=(6, 0))
+        self.lbl_pw_ratio = ttk.Label(res_card, text="0.00",
+                                       font=("Helvetica", 28, "bold"),
+                                       foreground=self._theme["ACCENT"],
+                                       background=self._theme["CARD_BG"])
+        self.lbl_pw_ratio.pack(padx=8, anchor=tk.W)
 
-        self.lbl_pw_details = ttk.Label(info_frame, text="", style="Small.TLabel",
+        ttk.Label(res_card, text="Category:", style="Card.TLabel").pack(padx=8, anchor=tk.W, pady=(4, 0))
+        self.lbl_pw_category = ttk.Label(res_card, text="",
+                                          font=("Helvetica", 14, "bold"),
+                                          foreground=self._theme["ACCENT2"],
+                                          background=self._theme["CARD_BG"])
+        self.lbl_pw_category.pack(padx=8, anchor=tk.W, pady=(0, 6))
+
+        self.lbl_pw_details = ttk.Label(info, text="", style="Small.TLabel",
                                          wraplength=280, justify=tk.LEFT)
-        self.lbl_pw_details.pack(fill=tk.X, padx=8, pady=4)
-
-        cat_frame = ttk.LabelFrame(left, text="Category Reference")
-        cat_frame.pack(fill=tk.X, pady=(0, 6))
-
-        ref_text = ""
-        for name, lo, hi in RIDER_CATEGORIES:
-            if hi == float("inf"):
-                ref_text += f"  {name}: {lo:.1f}+ W/kg\n"
-            else:
-                ref_text += f"  {name}: {lo:.1f} - {hi:.1f} W/kg\n"
-        ttk.Label(cat_frame, text=ref_text.strip(), style="Small.TLabel",
-                  justify=tk.LEFT).pack(padx=8, pady=4)
+        self.lbl_pw_details.pack(padx=8, pady=4)
 
         t = self._theme
         self.fig_pw = Figure(figsize=(7, 5), dpi=100, facecolor=t["BG"])
@@ -1006,11 +1228,11 @@ class BikeSimApp(tk.Tk):
         self.canvas_pw.draw_idle()
 
     # ==================================================================
-    # TAB 7: Race Simulation
+    # TAB 6: Race Simulation
     # ==================================================================
     def _build_race_tab(self) -> None:
         tab = ttk.Frame(self._notebook)
-        self._notebook.add(tab, text="  Race  ")
+        self._notebook.add(tab, text="  \U0001f3c1 Race  ")
 
         left = ttk.Frame(tab)
         left.pack(side=tk.LEFT, fill=tk.BOTH, padx=8, pady=4)
@@ -1018,26 +1240,27 @@ class BikeSimApp(tk.Tk):
         right = ttk.Frame(tab)
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=4)
 
-        comp_frame = ttk.LabelFrame(left, text="Competitors")
+        comp_frame = ttk.LabelFrame(left, text="Competitors", style="Card.TLabelframe")
         comp_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
 
-        btn_row = ttk.Frame(comp_frame)
-        btn_row.pack(fill=tk.X, padx=4, pady=4)
-        ttk.Button(btn_row, text="Add Competitor", style="Preset.TButton",
+        btn_row = ttk.Frame(comp_frame, style="Card.TFrame")
+        btn_row.pack(fill=tk.X, padx=6, pady=4)
+        ttk.Button(btn_row, text="+ Rider", style="Preset.TButton",
                    command=self._add_race_competitor).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_row, text="Add Me (Current)", style="Preset.TButton",
+        ttk.Button(btn_row, text="+ Me", style="Preset.TButton",
                    command=self._add_me_as_competitor).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_row, text="Remove Selected", style="Preset.TButton",
+        ttk.Button(btn_row, text="\u2212 Selected", style="Preset.TButton",
                    command=self._remove_race_competitor).pack(side=tk.LEFT, padx=2)
 
         self._race_competitors: list[RaceCompetitor] = []
         self._race_listbox = tk.Listbox(comp_frame, bg=self._theme["ENTRY_BG"],
                                          fg=self._theme["FG"], height=8,
                                          selectmode=tk.SINGLE,
-                                         font=("Segoe UI", 9))
-        self._race_listbox.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+                                         font=("Helvetica", 9), relief="flat", bd=0,
+                                         highlightthickness=1,
+                                         highlightcolor=self._theme["ACCENT"])
+        self._race_listbox.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
 
-        # Pre-populate with virtual competitors
         self._race_competitors = [
             RaceCompetitor("You", 250, 75, 178, 8.0),
             RaceCompetitor("Strong Rider", 300, 72, 175, 7.5,
@@ -1049,9 +1272,9 @@ class BikeSimApp(tk.Tk):
         ]
         self._refresh_race_listbox()
 
-        btn_row2 = ttk.Frame(comp_frame)
-        btn_row2.pack(fill=tk.X, padx=4, pady=4)
-        ttk.Button(btn_row2, text="Run Race",
+        btn_row2 = ttk.Frame(comp_frame, style="Card.TFrame")
+        btn_row2.pack(fill=tk.X, padx=6, pady=4)
+        ttk.Button(btn_row2, text="\u25b6 Run Race",
                    command=self._run_race).pack(side=tk.RIGHT, padx=2)
 
         self.lbl_race_results = ttk.Label(left, text="", style="Small.TLabel",
@@ -1073,7 +1296,7 @@ class BikeSimApp(tk.Tk):
             w_kg = power_to_weight_ratio(c.power_watts, c.weight_kg)
             self._race_listbox.insert(
                 tk.END,
-                f"{c.name}: {c.power_watts:.0f}W / {c.weight_kg:.0f}kg "
+                f"  {c.name}: {c.power_watts:.0f}W / {c.weight_kg:.0f}kg "
                 f"({w_kg:.1f} W/kg)"
             )
 
@@ -1215,7 +1438,7 @@ class BikeSimApp(tk.Tk):
     # ==================================================================
     def _build_3d_tab(self) -> None:
         tab = ttk.Frame(self._notebook)
-        self._notebook.add(tab, text="  3D / Map  ")
+        self._notebook.add(tab, text="  \U0001f30d 3D / Map  ")
 
         top = ttk.Frame(tab)
         top.pack(fill=tk.X, padx=8, pady=4)
@@ -1286,10 +1509,8 @@ class BikeSimApp(tk.Tk):
             ax.scatter([x[-1]], [y[-1]], [z[-1]], color=t["ACCENT4"], s=80,
                        marker="s", zorder=10, label="Finish")
 
-        width = max(0.02, (max(x) - min(x)) * 0.15) if len(x) > 1 else 0.1
-        for i in range(n):
-            ax.plot([x[i], x[i]], [-width, width], [z[i], z[i]],
-                    color=t["ACCENT2"], alpha=0.15, linewidth=0.5)
+        ax.plot(x, [0] * n, [min(z)] * n, linestyle=":", linewidth=0.5,
+                    color=t["ACCENT2"], alpha=0.15)
 
         ax.set_xlabel("Distance (km)", color=t["FG"], fontsize=8, labelpad=8)
         ax.set_ylabel("", color=t["FG"], fontsize=8)
@@ -1448,7 +1669,7 @@ class BikeSimApp(tk.Tk):
     # ==================================================================
     def _build_cp_tab(self) -> None:
         tab = ttk.Frame(self._notebook)
-        self._notebook.add(tab, text="  CP / W'  ")
+        self._notebook.add(tab, text="  \u26a1 CP / W'  ")
 
         left = ttk.Frame(tab)
         left.pack(side=tk.LEFT, fill=tk.BOTH, padx=8, pady=4)
@@ -1456,7 +1677,8 @@ class BikeSimApp(tk.Tk):
         right = ttk.Frame(tab)
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=4)
 
-        est_frame = ttk.LabelFrame(left, text="Estimate from FTP")
+        est_frame = ttk.LabelFrame(left, text="Estimate from FTP",
+                                    style="Card.TLabelframe")
         est_frame.pack(fill=tk.X, pady=(0, 6))
 
         ttk.Label(est_frame, text="Uses your current FTP slider value",
@@ -1464,7 +1686,8 @@ class BikeSimApp(tk.Tk):
         ttk.Button(est_frame, text="Estimate CP from FTP",
                    command=self._estimate_cp).pack(fill=tk.X, padx=8, pady=4)
 
-        fit_frame = ttk.LabelFrame(left, text="Fit from Two Efforts")
+        fit_frame = ttk.LabelFrame(left, text="Fit from Two Efforts",
+                                    style="Card.TLabelframe")
         fit_frame.pack(fill=tk.X, pady=(0, 6))
 
         self.var_cp_power1 = tk.DoubleVar(value=350)
@@ -1472,30 +1695,30 @@ class BikeSimApp(tk.Tk):
         self.var_cp_power2 = tk.DoubleVar(value=280)
         self.var_cp_dur2 = tk.DoubleVar(value=1200)
 
-        r1 = ttk.Frame(fit_frame)
+        r1 = ttk.Frame(fit_frame, style="Card.TFrame")
         r1.pack(fill=tk.X, padx=8, pady=2)
-        _label(r1, "Effort 1: Power (W)").pack(side=tk.LEFT)
+        _label(r1, "Effort 1: Power (W)", style="Card.TLabel").pack(side=tk.LEFT)
         ttk.Entry(r1, textvariable=self.var_cp_power1, width=6).pack(side=tk.RIGHT)
 
-        r2 = ttk.Frame(fit_frame)
+        r2 = ttk.Frame(fit_frame, style="Card.TFrame")
         r2.pack(fill=tk.X, padx=8, pady=2)
-        _label(r2, "Effort 1: Duration (s)").pack(side=tk.LEFT)
+        _label(r2, "Effort 1: Duration (s)", style="Card.TLabel").pack(side=tk.LEFT)
         ttk.Entry(r2, textvariable=self.var_cp_dur1, width=6).pack(side=tk.RIGHT)
 
-        r3 = ttk.Frame(fit_frame)
+        r3 = ttk.Frame(fit_frame, style="Card.TFrame")
         r3.pack(fill=tk.X, padx=8, pady=2)
-        _label(r3, "Effort 2: Power (W)").pack(side=tk.LEFT)
+        _label(r3, "Effort 2: Power (W)", style="Card.TLabel").pack(side=tk.LEFT)
         ttk.Entry(r3, textvariable=self.var_cp_power2, width=6).pack(side=tk.RIGHT)
 
-        r4 = ttk.Frame(fit_frame)
+        r4 = ttk.Frame(fit_frame, style="Card.TFrame")
         r4.pack(fill=tk.X, padx=8, pady=2)
-        _label(r4, "Effort 2: Duration (s)").pack(side=tk.LEFT)
+        _label(r4, "Effort 2: Duration (s)", style="Card.TLabel").pack(side=tk.LEFT)
         ttk.Entry(r4, textvariable=self.var_cp_dur2, width=6).pack(side=tk.RIGHT)
 
         ttk.Button(fit_frame, text="Fit CP Model",
                    command=self._fit_cp).pack(fill=tk.X, padx=8, pady=4)
 
-        res_frame = ttk.LabelFrame(left, text="Results")
+        res_frame = ttk.LabelFrame(left, text="Results", style="Card.TLabelframe")
         res_frame.pack(fill=tk.X, pady=(0, 6))
         self.lbl_cp_result = ttk.Label(res_frame, text="", style="Small.TLabel",
                                         wraplength=280, justify=tk.LEFT)
@@ -1592,7 +1815,7 @@ class BikeSimApp(tk.Tk):
     # ==================================================================
     def _build_pacing_tab(self) -> None:
         tab = ttk.Frame(self._notebook)
-        self._notebook.add(tab, text="  Pacing  ")
+        self._notebook.add(tab, text="  \U0001f3af Pacing  ")
 
         left = ttk.Frame(tab)
         left.pack(side=tk.LEFT, fill=tk.BOTH, padx=8, pady=4)
@@ -1600,22 +1823,23 @@ class BikeSimApp(tk.Tk):
         right = ttk.Frame(tab)
         right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=4)
 
-        ctrl = ttk.LabelFrame(left, text="Pacing Settings")
+        ctrl = ttk.LabelFrame(left, text="Pacing Settings", style="Card.TLabelframe")
         ctrl.pack(fill=tk.X, pady=(0, 6))
 
         ttk.Label(ctrl, text="Uses course segments from Course Profile tab",
                   style="Small.TLabel").pack(padx=8, pady=2)
 
         self.var_target_power = tk.DoubleVar(value=200)
-        r1 = ttk.Frame(ctrl)
+        r1 = ttk.Frame(ctrl, style="Card.TFrame")
         r1.pack(fill=tk.X, padx=8, pady=2)
-        _label(r1, "Target Avg Power (W):").pack(side=tk.LEFT)
+        _label(r1, "Target Avg Power (W):", style="Card.TLabel").pack(side=tk.LEFT)
         ttk.Entry(r1, textvariable=self.var_target_power, width=6).pack(side=tk.RIGHT)
 
-        ttk.Button(ctrl, text="Optimize Pacing",
+        ttk.Button(ctrl, text="\u25b6 Optimize Pacing",
                    command=self._run_pacing).pack(fill=tk.X, padx=8, pady=4)
 
-        res_frame = ttk.LabelFrame(left, text="Optimization Results")
+        res_frame = ttk.LabelFrame(left, text="Optimization Results",
+                                    style="Card.TLabelframe")
         res_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
         self.lbl_pacing_result = ttk.Label(res_frame, text="", style="Small.TLabel",
                                             wraplength=280, justify=tk.LEFT)
@@ -1649,17 +1873,13 @@ class BikeSimApp(tk.Tk):
                 pass
 
         if not segments:
-            segments = [
-                CourseSegment(distance_m=5000, grade_pct=0),
-                CourseSegment(distance_m=2000, grade_pct=5),
-                CourseSegment(distance_m=3000, grade_pct=-3),
-                CourseSegment(distance_m=5000, grade_pct=0),
-                CourseSegment(distance_m=1000, grade_pct=8),
-                CourseSegment(distance_m=4000, grade_pct=-2),
-            ]
+            messagebox.showwarning("No Segments",
+                                   "Add course segments in the Course Profile tab first.")
+            return
 
-        target = self.var_target_power.get()
-        result = optimize_pacing(rider, bike, segments, ftp, target)
+        target_power = self.var_target_power.get()
+        result = optimize_pacing(rider, bike, segments, ftp,
+                                  target_avg_power=target_power)
 
         mins = int(result.total_time_s // 60)
         secs = int(result.total_time_s % 60)
@@ -1677,7 +1897,7 @@ class BikeSimApp(tk.Tk):
         for ps in result.segments:
             text += (
                 f"  Seg {ps.segment_index+1}: {ps.grade_pct:+.1f}% "
-                f"→ {ps.optimal_power:.0f}W "
+                f"\u2192 {ps.optimal_power:.0f}W "
                 f"({ps.speed_kmh:.1f} km/h) "
                 f"[{ps.strategy_note}]\n"
             )
@@ -1749,28 +1969,459 @@ class BikeSimApp(tk.Tk):
         self.canvas_pacing.draw_idle()
 
     # ==================================================================
-    # TAB 10: Export
+    # TAB 10: Real-Time Live Ride Simulation
+    # ==================================================================
+    def _build_realtime_tab(self) -> None:
+        tab = ttk.Frame(self._notebook)
+        self._notebook.add(tab, text="  \u23f1 Live Ride  ")
+
+        # Left panel: controls + live metrics
+        left = ttk.Frame(tab)
+        left.pack(side=tk.LEFT, fill=tk.BOTH, padx=8, pady=4)
+
+        # Controls card
+        ctrl = ttk.LabelFrame(left, text="\u25b6 Ride Controls",
+                               style="Card.TLabelframe")
+        ctrl.pack(fill=tk.X, pady=(0, 6))
+
+        ttk.Label(ctrl, text="Uses course from Course Profile tab",
+                  style="Small.TLabel").pack(padx=8, pady=(4, 2))
+
+        btn_row = ttk.Frame(ctrl, style="Card.TFrame")
+        btn_row.pack(fill=tk.X, padx=8, pady=4)
+
+        self._rt_start_btn = ttk.Button(btn_row, text="\u25b6 Start",
+                                         style="Success.TButton",
+                                         command=self._rt_start)
+        self._rt_start_btn.pack(side=tk.LEFT, padx=2)
+
+        self._rt_pause_btn = ttk.Button(btn_row, text="\u23f8 Pause",
+                                         style="Secondary.TButton",
+                                         command=self._rt_pause)
+        self._rt_pause_btn.pack(side=tk.LEFT, padx=2)
+
+        self._rt_reset_btn = ttk.Button(btn_row, text="\u21ba Reset",
+                                         style="Danger.TButton",
+                                         command=self._rt_reset)
+        self._rt_reset_btn.pack(side=tk.LEFT, padx=2)
+
+        # Speed multiplier
+        speed_frame = ttk.Frame(ctrl, style="Card.TFrame")
+        speed_frame.pack(fill=tk.X, padx=8, pady=2)
+        _label(speed_frame, "Sim Speed:", style="Card.TLabel").pack(side=tk.LEFT)
+        self._rt_speed_lbl = _label(speed_frame, "10x", style="Card.TLabel")
+        self._rt_speed_lbl.pack(side=tk.RIGHT, padx=(4, 0))
+        speed_scale = _make_scale(speed_frame, 1, 50, self.var_rt_speed_mult,
+                                  command=self._rt_speed_changed)
+        speed_scale.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=4)
+
+        # Live power slider
+        power_frame = ttk.Frame(ctrl, style="Card.TFrame")
+        power_frame.pack(fill=tk.X, padx=8, pady=(2, 6))
+        _label(power_frame, "Live Power:", style="Card.TLabel").pack(side=tk.LEFT)
+        self._rt_power_lbl = _label(power_frame, "200 W", style="Card.TLabel")
+        self._rt_power_lbl.pack(side=tk.RIGHT, padx=(4, 0))
+        power_scale = _make_scale(power_frame, 0, 600, self.var_rt_power,
+                                  command=self._rt_power_changed)
+        power_scale.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=4)
+
+        # Live metrics dashboard
+        metrics = ttk.LabelFrame(left, text="\U0001f4ca Live Metrics",
+                                  style="Card.TLabelframe")
+        metrics.pack(fill=tk.X, pady=(0, 6))
+
+        # Speed display
+        speed_card = ttk.Frame(metrics, style="MetricCard.TFrame")
+        speed_card.pack(fill=tk.X, padx=8, pady=4)
+        self._rt_speed_display = ttk.Label(speed_card, text="0.0",
+                                            style="RTMetric.TLabel")
+        self._rt_speed_display.pack(side=tk.LEFT, padx=8)
+        ttk.Label(speed_card, text="km/h", style="RTLabel.TLabel").pack(
+            side=tk.LEFT, anchor=tk.S, pady=(0, 6))
+        self._rt_grade_display = ttk.Label(speed_card, text="0.0%",
+                                            style="RTGrade.TLabel")
+        self._rt_grade_display.pack(side=tk.RIGHT, padx=8)
+        ttk.Label(speed_card, text="grade", style="RTLabel.TLabel").pack(
+            side=tk.RIGHT, anchor=tk.S, pady=(0, 4))
+
+        # Metrics grid
+        grid_frame = ttk.Frame(metrics, style="Card.TFrame")
+        grid_frame.pack(fill=tk.X, padx=8, pady=(0, 6))
+
+        self._rt_labels: dict[str, ttk.Label] = {}
+        metric_defs = [
+            ("Distance", "0.00 km", 0, 0),
+            ("Elapsed", "0:00", 0, 1),
+            ("Avg Speed", "0.0 km/h", 1, 0),
+            ("Calories", "0 kcal", 1, 1),
+            ("Segment", "1 / 1", 2, 0),
+            ("Zone", "Z2", 2, 1),
+        ]
+        for name, default, row, col in metric_defs:
+            cell = ttk.Frame(grid_frame, style="Card.TFrame")
+            cell.grid(row=row, column=col, sticky="ew", padx=4, pady=2)
+            ttk.Label(cell, text=name, style="RTLabel.TLabel").pack(anchor=tk.W)
+            lbl = ttk.Label(cell, text=default,
+                            font=("Helvetica", 12, "bold"),
+                            foreground=self._theme["FG"],
+                            background=self._theme["CARD_BG"])
+            lbl.pack(anchor=tk.W)
+            self._rt_labels[name] = lbl
+        grid_frame.columnconfigure(0, weight=1)
+        grid_frame.columnconfigure(1, weight=1)
+
+        # W' Balance bar
+        wprime_frame = ttk.LabelFrame(left, text="W' Balance",
+                                       style="Card.TLabelframe")
+        wprime_frame.pack(fill=tk.X, pady=(0, 6))
+
+        self._rt_wprime_pct = ttk.Label(wprime_frame, text="100%",
+                                         font=("Helvetica", 14, "bold"),
+                                         foreground=self._theme["ACCENT2"],
+                                         background=self._theme["CARD_BG"])
+        self._rt_wprime_pct.pack(padx=8, anchor=tk.W, pady=(4, 0))
+
+        self._rt_wprime_bar = ttk.Progressbar(
+            wprime_frame, mode="determinate", maximum=100,
+            style="W.Horizontal.TProgressbar", length=250)
+        self._rt_wprime_bar.pack(fill=tk.X, padx=8, pady=(2, 6))
+        self._rt_wprime_bar["value"] = 100
+
+        self._rt_wprime_detail = ttk.Label(wprime_frame, text="20.0 / 20.0 kJ",
+                                            style="Small.TLabel")
+        self._rt_wprime_detail.pack(padx=8, anchor=tk.W, pady=(0, 4))
+
+        # Right panel: charts
+        right = ttk.Frame(tab)
+        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=4)
+
+        t = self._theme
+        self.fig_rt = Figure(figsize=(8, 6), dpi=100, facecolor=t["BG"])
+        self.fig_rt.subplots_adjust(hspace=0.45, left=0.10, right=0.95,
+                                     top=0.95, bottom=0.08)
+        self.ax_rt_course = self.fig_rt.add_subplot(311)
+        self.ax_rt_speed = self.fig_rt.add_subplot(312)
+        self.ax_rt_power = self.fig_rt.add_subplot(313)
+        self.canvas_rt = FigureCanvasTkAgg(self.fig_rt, master=right)
+        self.canvas_rt.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+    def _rt_speed_changed(self, value: str) -> None:
+        v = int(float(value))
+        self.var_rt_speed_mult.set(v)
+        self._rt_speed_lbl.configure(text=f"{v}x")
+
+    def _rt_power_changed(self, value: str) -> None:
+        v = int(float(value))
+        self.var_rt_power.set(v)
+        self._rt_power_lbl.configure(text=f"{v} W")
+
+    def _rt_get_segments(self) -> list[CourseSegment]:
+        segments: list[CourseSegment] = []
+        for sv in self._course_segments:
+            try:
+                segments.append(CourseSegment(
+                    distance_m=sv["distance"].get(),
+                    grade_pct=sv["grade"].get(),
+                    headwind_kmh=sv["wind"].get(),
+                    wind_direction_deg=sv["wind_dir"].get(),
+                    elevation_m=sv["elevation"].get(),
+                    temperature_c=sv["temperature"].get(),
+                ))
+            except (tk.TclError, ValueError):
+                pass
+        if not segments:
+            segments = [
+                CourseSegment(distance_m=2000, grade_pct=0),
+                CourseSegment(distance_m=1500, grade_pct=5),
+                CourseSegment(distance_m=1000, grade_pct=-3),
+                CourseSegment(distance_m=2000, grade_pct=0),
+            ]
+        return segments
+
+    def _rt_draw_base_course(self, segments: list[CourseSegment]) -> None:
+        """Draw the full course elevation profile as background."""
+        t = self._theme
+        ax = self.ax_rt_course
+        ax.clear()
+        _style_ax(ax, t)
+
+        total_dist = sum(s.distance_m for s in segments)
+        n_points = max(100, int(total_dist / 10))
+        distances = [i * total_dist / n_points for i in range(n_points + 1)]
+        elevations = [compute_elevation_at_distance(segments, d) for d in distances]
+        distances_km = [d / 1000 for d in distances]
+
+        ax.fill_between(distances_km, elevations, alpha=0.2, color=t["ACCENT2"])
+        ax.plot(distances_km, elevations, color=t["ACCENT2"], linewidth=1.5, alpha=0.5)
+
+        # Grade color coding on segments
+        cum = 0.0
+        for seg in segments:
+            seg_start_km = cum / 1000
+            seg_end_km = (cum + seg.distance_m) / 1000
+            if seg.grade_pct > 5:
+                color = t["ACCENT4"]
+            elif seg.grade_pct > 2:
+                color = t["ACCENT3"]
+            elif seg.grade_pct > 0:
+                color = t["ACCENT2"]
+            else:
+                color = t["ACCENT"]
+            ax.axvspan(seg_start_km, seg_end_km, alpha=0.05, color=color)
+            cum += seg.distance_m
+
+        ax.set_ylabel("Elevation (m)", color=t["FG"], fontsize=9)
+        ax.set_title("Course Profile — Live Ride", color=t["FG"],
+                     fontsize=11, fontweight="bold")
+
+        # Rider dot (will be updated)
+        self._rt_dot, = ax.plot([], [], "o", color=t["ACCENT4"], markersize=12,
+                                 zorder=10, markeredgecolor="#ffffff",
+                                 markeredgewidth=2)
+
+        self.canvas_rt.draw_idle()
+
+    def _rt_start(self) -> None:
+        if self._rt_running:
+            return
+
+        segments = self._rt_get_segments()
+        if not segments:
+            messagebox.showwarning("No Course", "Add course segments first.")
+            return
+
+        if self._rt_elapsed == 0.0:
+            # Fresh start
+            self._rt_segments = segments
+            self._rt_distance = 0.0
+            self._rt_elapsed = 0.0
+            self._rt_calories = 0.0
+            ftp = self.var_ftp.get()
+            self._rt_cp_model = estimate_cp_from_ftp(ftp)
+            self._rt_w_prime = self._rt_cp_model.w_prime_joules
+            self._rt_speed_history = []
+            self._rt_power_history = []
+            self._rt_time_history = []
+            self._rt_elev_history = []
+            self._rt_grade_history = []
+            self._rt_draw_base_course(segments)
+
+        self._rt_running = True
+        self._rt_start_btn.configure(state="disabled")
+        self._rt_tick()
+
+    def _rt_pause(self) -> None:
+        self._rt_running = False
+        self._rt_start_btn.configure(state="normal")
+        if self._rt_timer_id:
+            self.after_cancel(self._rt_timer_id)
+            self._rt_timer_id = None
+
+    def _rt_reset(self) -> None:
+        self._rt_pause()
+        self._rt_elapsed = 0.0
+        self._rt_distance = 0.0
+        self._rt_calories = 0.0
+        self._rt_w_prime = 0.0
+        self._rt_speed_history = []
+        self._rt_power_history = []
+        self._rt_time_history = []
+        self._rt_elev_history = []
+        self._rt_grade_history = []
+
+        self._rt_speed_display.configure(text="0.0")
+        self._rt_grade_display.configure(text="0.0%")
+        self._rt_wprime_bar["value"] = 100
+        self._rt_wprime_pct.configure(text="100%")
+        for name in self._rt_labels:
+            defaults = {"Distance": "0.00 km", "Elapsed": "0:00",
+                        "Avg Speed": "0.0 km/h", "Calories": "0 kcal",
+                        "Segment": "1 / 1", "Zone": "Z2"}
+            self._rt_labels[name].configure(text=defaults.get(name, ""))
+
+        # Clear charts
+        for ax in [self.ax_rt_course, self.ax_rt_speed, self.ax_rt_power]:
+            ax.clear()
+        self.canvas_rt.draw_idle()
+
+    def _rt_tick(self) -> None:
+        if not self._rt_running:
+            return
+
+        rider, bike, _ = self._gather_params()
+        power = self.var_rt_power.get()
+        ftp = self.var_ftp.get()
+        speed_mult = self.var_rt_speed_mult.get()
+        dt = 1.0 * speed_mult  # simulated seconds per tick
+
+        state = compute_realtime_tick(
+            rider, bike, self._rt_segments, power, ftp,
+            self._rt_cp_model,
+            self._rt_elapsed, dt,
+            self._rt_distance, self._rt_w_prime, self._rt_calories,
+        )
+
+        self._rt_elapsed = state.elapsed_time_s
+        self._rt_distance = state.distance_m
+        self._rt_w_prime = state.w_prime_balance_j
+        self._rt_calories = state.calories_kcal
+
+        # Record history
+        self._rt_time_history.append(state.elapsed_time_s)
+        self._rt_speed_history.append(state.current_speed_kmh)
+        self._rt_power_history.append(state.current_power_watts)
+        self._rt_elev_history.append(state.current_elevation_m)
+        self._rt_grade_history.append(state.current_grade_pct)
+
+        # Update UI
+        self._rt_update_display(state)
+
+        if state.is_finished:
+            self._rt_running = False
+            self._rt_start_btn.configure(state="normal")
+            messagebox.showinfo("Ride Complete",
+                                f"Finished in {_format_time(state.elapsed_time_s)}\n"
+                                f"Distance: {state.distance_m/1000:.2f} km\n"
+                                f"Avg Speed: {state.avg_speed_kmh:.1f} km/h\n"
+                                f"Calories: {state.calories_kcal:.0f} kcal")
+            return
+
+        self._rt_timer_id = self.after(100, self._rt_tick)
+
+    def _rt_update_display(self, state: RealTimeState) -> None:
+        t = self._theme
+
+        # Speed
+        self._rt_speed_display.configure(text=f"{state.current_speed_kmh:.1f}")
+
+        # Grade
+        grade_text = f"{state.current_grade_pct:+.1f}%"
+        if state.current_grade_pct > 5:
+            grade_color = t["ACCENT4"]
+        elif state.current_grade_pct > 2:
+            grade_color = t["ACCENT3"]
+        elif state.current_grade_pct > 0:
+            grade_color = t["ACCENT2"]
+        else:
+            grade_color = t["ACCENT"]
+        self._rt_grade_display.configure(text=grade_text, foreground=grade_color)
+
+        # Metrics
+        self._rt_labels["Distance"].configure(
+            text=f"{state.distance_m / 1000:.2f} km")
+        self._rt_labels["Elapsed"].configure(
+            text=_format_time(state.elapsed_time_s))
+        self._rt_labels["Avg Speed"].configure(
+            text=f"{state.avg_speed_kmh:.1f} km/h")
+        self._rt_labels["Calories"].configure(
+            text=f"{state.calories_kcal:.0f} kcal")
+        n_segs = len(self._rt_segments) if hasattr(self, '_rt_segments') else 1
+        self._rt_labels["Segment"].configure(
+            text=f"{state.segment_index + 1} / {n_segs}")
+        self._rt_labels["Zone"].configure(
+            text=state.power_zone_name)
+
+        # W' balance
+        w_pct = (state.w_prime_balance_j / state.w_prime_max_j * 100
+                 if state.w_prime_max_j > 0 else 100)
+        self._rt_wprime_bar["value"] = w_pct
+        self._rt_wprime_pct.configure(text=f"{w_pct:.0f}%")
+        if w_pct > 60:
+            self._rt_wprime_pct.configure(foreground=t["SUCCESS"])
+            self._rt_wprime_bar.configure(style="W.Horizontal.TProgressbar")
+        elif w_pct > 30:
+            self._rt_wprime_pct.configure(foreground=t["WARNING"])
+            self._rt_wprime_bar.configure(style="W.Horizontal.TProgressbar")
+        else:
+            self._rt_wprime_pct.configure(foreground=t["DANGER"])
+            self._rt_wprime_bar.configure(style="Danger.Horizontal.TProgressbar")
+        self._rt_wprime_detail.configure(
+            text=f"{state.w_prime_balance_j/1000:.1f} / {state.w_prime_max_j/1000:.1f} kJ")
+
+        # Update charts every 5 ticks to reduce redraw overhead
+        if len(self._rt_time_history) % 5 == 0 or state.is_finished:
+            self._rt_update_charts(state)
+
+    def _rt_update_charts(self, state: RealTimeState) -> None:
+        t = self._theme
+
+        # Course profile with rider dot
+        ax1 = self.ax_rt_course
+        if hasattr(self, '_rt_dot'):
+            dist_km = state.distance_m / 1000
+            self._rt_dot.set_data([dist_km], [state.current_elevation_m])
+
+        # Speed trace
+        ax2 = self.ax_rt_speed
+        ax2.clear()
+        _style_ax(ax2, t)
+        time_mins = [ts / 60 for ts in self._rt_time_history]
+        if time_mins:
+            ax2.plot(time_mins, self._rt_speed_history, color=t["ACCENT"],
+                     linewidth=1.5)
+            ax2.fill_between(time_mins, self._rt_speed_history,
+                             alpha=0.15, color=t["ACCENT"])
+            if len(self._rt_speed_history) > 1:
+                avg = sum(self._rt_speed_history) / len(self._rt_speed_history)
+                ax2.axhline(avg, color=t["ACCENT4"], linestyle="--",
+                            linewidth=1, alpha=0.7)
+        ax2.set_ylabel("Speed (km/h)", color=t["FG"], fontsize=9)
+        ax2.set_title("Live Speed", color=t["FG"], fontsize=10, fontweight="bold")
+
+        # Power trace
+        ax3 = self.ax_rt_power
+        ax3.clear()
+        _style_ax(ax3, t)
+        if time_mins:
+            ftp = self.var_ftp.get()
+            zones = power_zones(ftp)
+            max_pw = max(self._rt_power_history) * 1.1 if self._rt_power_history else 500
+            for name, lo, hi, color in zones:
+                if hi > 3000:
+                    hi = max_pw
+                ax3.axhspan(lo, min(hi, max_pw), alpha=0.08, color=color)
+
+            for i in range(len(time_mins) - 1):
+                _, color = zone_for_power(self._rt_power_history[i], ftp)
+                ax3.fill_between(
+                    [time_mins[i], time_mins[i + 1]],
+                    [self._rt_power_history[i], self._rt_power_history[i + 1]],
+                    alpha=0.5, color=color
+                )
+            ax3.plot(time_mins, self._rt_power_history, color=t["FG"],
+                     linewidth=0.5, alpha=0.5)
+        ax3.set_xlabel("Time (min)", color=t["FG"], fontsize=9)
+        ax3.set_ylabel("Power (W)", color=t["FG"], fontsize=9)
+        ax3.set_title("Live Power", color=t["FG"], fontsize=10, fontweight="bold")
+
+        self.canvas_rt.draw_idle()
+
+    # ==================================================================
+    # TAB 11: Export
     # ==================================================================
     def _build_export_tab(self) -> None:
         tab = ttk.Frame(self._notebook)
-        self._notebook.add(tab, text="  Export  ")
+        self._notebook.add(tab, text="  \U0001f4be Export  ")
 
         info = ttk.Frame(tab)
         info.pack(fill=tk.X, padx=20, pady=20)
 
         _label(info, "Export current simulation or course profile results.",
-               font=("Segoe UI", 12)).pack(anchor=tk.W, pady=4)
+               font=("Helvetica", 12)).pack(anchor=tk.W, pady=4)
 
-        ttk.Button(info, text="Export Current Result to CSV",
-                   command=self._export_result_csv).pack(anchor=tk.W, pady=4)
-        ttk.Button(info, text="Export Course Profile to CSV",
-                   command=self._export_course_csv).pack(anchor=tk.W, pady=4)
-        ttk.Button(info, text="Export Comparison to CSV",
-                   command=self._export_comparison).pack(anchor=tk.W, pady=4)
-        ttk.Button(info, text="Export Workout to CSV",
-                   command=self._export_workout_csv).pack(anchor=tk.W, pady=4)
-        ttk.Button(info, text="Generate PDF Report",
-                   command=self._export_pdf).pack(anchor=tk.W, pady=4)
+        btn_frame = ttk.Frame(info)
+        btn_frame.pack(anchor=tk.W, pady=8)
+
+        buttons = [
+            ("Export Current Result to CSV", self._export_result_csv),
+            ("Export Course Profile to CSV", self._export_course_csv),
+            ("Export Comparison to CSV", self._export_comparison),
+            ("Export Workout to CSV", self._export_workout_csv),
+            ("Generate PDF Report", self._export_pdf),
+        ]
+        for text, cmd in buttons:
+            ttk.Button(btn_frame, text=text, style="Secondary.TButton",
+                       command=cmd).pack(anchor=tk.W, pady=3)
 
     def _export_result_csv(self) -> None:
         rider, bike, course = self._gather_params()
@@ -1800,6 +2451,16 @@ class BikeSimApp(tk.Tk):
         if path:
             export_workout_csv(self._last_workout_result, path)
             messagebox.showinfo("Exported", f"Workout saved to {path}")
+
+    def _export_comparison(self) -> None:
+        if not self._scenarios:
+            messagebox.showwarning("No Data", "Snapshot at least one scenario first.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv", filetypes=[("CSV", "*.csv")])
+        if path:
+            export_comparison_csv(self._scenarios, path)
+            messagebox.showinfo("Exported", f"Comparison saved to {path}")
 
     def _export_pdf(self) -> None:
         path = filedialog.asksaveasfilename(
@@ -1904,14 +2565,23 @@ class BikeSimApp(tk.Tk):
         from_: float,
         to: float,
         resolution: float,
+        unit: str = "",
     ) -> dict[str, Any]:
-        row = ttk.Frame(parent)
-        row.pack(fill=tk.X, padx=8, pady=2)
+        row = ttk.Frame(parent, style="Card.TFrame")
+        row.pack(fill=tk.X, padx=10, pady=2)
 
-        lbl_widget = _label(row, f"{label}:")
+        lbl_text = f"{label}:"
+        lbl_widget = _label(row, lbl_text, style="Card.TLabel")
         lbl_widget.pack(side=tk.LEFT)
-        val_label = _label(row, f"{var.get():.1f}")
-        val_label.pack(side=tk.RIGHT, padx=(4, 0))
+
+        # Value + unit on the right
+        val_frame = ttk.Frame(row, style="Card.TFrame")
+        val_frame.pack(side=tk.RIGHT)
+        val_label = _label(val_frame, f"{var.get():.1f}", style="Card.TLabel")
+        val_label.pack(side=tk.LEFT, padx=(4, 0))
+        if unit:
+            unit_lbl = _label(val_frame, f" {unit}", style="Card.TLabel")
+            unit_lbl.pack(side=tk.LEFT)
 
         scale = _make_scale(
             row, from_, to, var,
@@ -1959,11 +2629,11 @@ class BikeSimApp(tk.Tk):
     def _toggle_units(self) -> None:
         self._imperial = not self._imperial
         if self._imperial:
-            self._unit_btn.configure(text="Switch to Metric")
+            self._unit_btn.configure(text="\u21c4 Metric")
             self.lbl_speed_unit1.configure(text="mph")
             self.lbl_speed_unit2.configure(text="km/h")
         else:
-            self._unit_btn.configure(text="Switch to Imperial")
+            self._unit_btn.configure(text="\u21c4 Imperial")
             self.lbl_speed_unit1.configure(text="km/h")
             self.lbl_speed_unit2.configure(text="mph")
         self._run_simulation()
@@ -2054,6 +2724,7 @@ class BikeSimApp(tk.Tk):
             self.lbl_error.configure(text="")
 
         result = solve_speed(rider, bike, course)
+        self._last_result = result
 
         if self._imperial:
             self.lbl_speed_primary.configure(text=f"{result.speed_mph:.1f}")
@@ -2064,28 +2735,30 @@ class BikeSimApp(tk.Tk):
 
         # Calorie estimate for 1 hour at current power
         cal_1hr = estimate_calories(rider.power_watts, 3600)
-        self.lbl_calories.configure(text=f"~{cal_1hr:.0f} kcal/hr")
+        self._metric_cal["value"].configure(text=f"{cal_1hr:.0f}")
 
         # Power zone
         ftp = self.var_ftp.get()
         zone_name, zone_color = zone_for_power(rider.power_watts, ftp)
-        self.lbl_zone.configure(text=zone_name)
+        self._metric_zone["value"].configure(text=zone_name)
 
         # W/kg on main tab
         w_kg = power_to_weight_ratio(ftp, rider.weight_kg)
         cat = classify_rider(w_kg)
-        self.lbl_wkg.configure(text=f"{w_kg:.2f} W/kg ({cat})")
+        self._metric_wkg["value"].configure(text=f"{w_kg:.2f}")
+        self._metric_wkg["label"].configure(text=f"W/KG ({cat})")
 
         details = (
-            f"Air density: {result.air_density:.3f} kg/m\u00b3  |  "
-            f"CdA: {result.cda:.4f} m\u00b2  |  Crr: {result.crr:.4f}\n"
-            f"Aero: {result.power_aero:.1f} W  |  "
-            f"Rolling: {result.power_rolling:.1f} W  |  "
-            f"Gravity: {result.power_gravity:.1f} W  |  "
+            f"Air density: {result.air_density:.3f} kg/m\u00b3  \u2502  "
+            f"CdA: {result.cda:.4f} m\u00b2  \u2502  Crr: {result.crr:.4f}\n"
+            f"Aero: {result.power_aero:.1f} W  \u2502  "
+            f"Rolling: {result.power_rolling:.1f} W  \u2502  "
+            f"Gravity: {result.power_gravity:.1f} W  \u2502  "
             f"Drivetrain loss: {result.power_drivetrain_loss:.1f} W"
         )
         self.lbl_details.configure(text=details)
         self._update_charts(rider, bike, course, result)
+        self._update_status_bar(result, rider)
 
     def _update_charts(
         self,
