@@ -23,33 +23,22 @@ from simulation import (
     BikeParams,
     CourseParams,
     CourseSegment,
-    CriticalPowerModel,
-    IntervalStep,
-    KOM_BENCHMARKS,
     PRESETS,
     Preset,
-    RaceCompetitor,
     RealTimeState,
-    RIDER_CATEGORIES,
     RiderParams,
     RidingPosition,
     SimulationResult,
     TireType,
     WhatIfChange,
-    ZONE_COLORS,
-    ZONE_NAMES,
     analyze_ride,
     classify_rider,
     compute_elevation_at_distance,
     compute_realtime_tick,
     estimate_calories,
     estimate_cp_from_ftp,
-    export_comparison_csv,
     export_course_csv,
     export_result_csv,
-    export_workout_csv,
-    find_segment_at_distance,
-    fit_cp_model,
     load_presets,
     optimize_pacing,
     parse_gpx,
@@ -60,20 +49,11 @@ from simulation import (
     predict_kom,
     save_presets,
     simulate_course_profile,
-    simulate_race,
-    simulate_workout,
     solve_speed,
     speed_vs_power_curve,
     validate_all,
-    w_per_kg_analysis,
     what_if_analysis,
     zone_for_power,
-    # Unit conversions
-    kg_to_lbs, lbs_to_kg,
-    cm_to_inches, inches_to_cm,
-    m_to_feet, feet_to_m,
-    celsius_to_fahrenheit, fahrenheit_to_celsius,
-    kmh_to_mph, mph_to_kmh,
 )
 
 # ---------------------------------------------------------------------------
@@ -190,10 +170,8 @@ class BikeSimApp(tk.Tk):
 
         self._theme = DARK
         self._imperial = False
-        self._scenarios: list[tuple[str, RiderParams, BikeParams, CourseParams, SimulationResult]] = []
         self._custom_presets: list[Preset] = []
         self._course_segments: list[dict[str, tk.DoubleVar]] = []
-        self._interval_steps: list[dict[str, tk.DoubleVar]] = []
         self._animation_id: str | None = None
         self._last_course_result: Any = None
         self._last_result: SimulationResult | None = None
@@ -395,12 +373,7 @@ class BikeSimApp(tk.Tk):
 
         self._build_main_tab()
         self._build_course_tab()
-        self._build_workout_tab()
-        self._build_compare_tab()
-        self._build_pw_ratio_tab()
-        self._build_race_tab()
         self._build_3d_tab()
-        self._build_cp_tab()
         self._build_pacing_tab()
         self._build_realtime_tab()
         self._build_ride_analysis_tab()
@@ -934,589 +907,6 @@ class BikeSimApp(tk.Tk):
         step()
 
     # ==================================================================
-    # TAB 3: Workout / Intervals
-    # ==================================================================
-    def _build_workout_tab(self) -> None:
-        tab = ttk.Frame(self._notebook)
-        self._notebook.add(tab, text="  \U0001f3cb Workout  ")
-
-        left = ttk.Frame(tab)
-        left.pack(side=tk.LEFT, fill=tk.BOTH, padx=8, pady=4, expand=False)
-
-        right = ttk.Frame(tab)
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=4)
-
-        intv_frame = ttk.LabelFrame(left, text="Interval Steps", style="Card.TLabelframe")
-        intv_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
-
-        btn_row = ttk.Frame(intv_frame, style="Card.TFrame")
-        btn_row.pack(fill=tk.X, padx=6, pady=4)
-        ttk.Button(btn_row, text="+ Step", style="Preset.TButton",
-                   command=self._add_interval_step).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_row, text="\u2212 Last", style="Preset.TButton",
-                   command=self._remove_interval_step).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_row, text="\u25b6 Run Workout",
-                   command=self._run_workout).pack(side=tk.RIGHT, padx=2)
-
-        self._intv_listbox = tk.Listbox(intv_frame, bg=self._theme["ENTRY_BG"],
-                                         fg=self._theme["FG"], height=8,
-                                         font=("Helvetica", 9), relief="flat", bd=0,
-                                         highlightthickness=1,
-                                         highlightcolor=self._theme["ACCENT"])
-        self._intv_listbox.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
-
-        for pw, dur in [(150, 300), (300, 180), (150, 120), (350, 180), (100, 300)]:
-            self._add_interval_step(power=pw, duration=dur)
-
-        self.lbl_workout_summary = ttk.Label(left, text="", style="Small.TLabel",
-                                              wraplength=300, justify=tk.LEFT)
-        self.lbl_workout_summary.pack(fill=tk.X, pady=4)
-
-        t = self._theme
-        self.fig_workout = Figure(figsize=(7, 5), dpi=100, facecolor=t["BG"])
-        self.fig_workout.subplots_adjust(hspace=0.40, left=0.10, right=0.95,
-                                          top=0.94, bottom=0.10)
-        self.ax_workout_power = self.fig_workout.add_subplot(211)
-        self.ax_workout_speed = self.fig_workout.add_subplot(212)
-        self.canvas_workout = FigureCanvasTkAgg(self.fig_workout, master=right)
-        self.canvas_workout.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-
-    def _add_interval_step(self, power: float = 200, duration: float = 300) -> None:
-        step_vars: dict[str, tk.DoubleVar] = {
-            "power": tk.DoubleVar(value=power),
-            "duration": tk.DoubleVar(value=duration),
-        }
-        self._interval_steps.append(step_vars)
-        self._refresh_intv_listbox()
-
-    def _remove_interval_step(self) -> None:
-        if self._interval_steps:
-            self._interval_steps.pop()
-            self._refresh_intv_listbox()
-
-    def _refresh_intv_listbox(self) -> None:
-        self._intv_listbox.delete(0, tk.END)
-        for i, sv in enumerate(self._interval_steps):
-            pw = sv["power"].get()
-            dur = sv["duration"].get()
-            mins = int(dur // 60)
-            secs = int(dur % 60)
-            zone_name, _ = zone_for_power(pw, self.var_ftp.get())
-            self._intv_listbox.insert(tk.END,
-                f"  Step {i+1}: {pw:.0f}W \u00d7 {mins}:{secs:02d} ({zone_name})")
-
-    def _run_workout(self) -> None:
-        rider, bike, course = self._gather_params()
-        steps: list[IntervalStep] = []
-        for sv in self._interval_steps:
-            steps.append(IntervalStep(
-                power_watts=sv["power"].get(),
-                duration_s=sv["duration"].get(),
-            ))
-
-        if not steps:
-            messagebox.showwarning("No Steps", "Add at least one interval step.")
-            return
-
-        result = simulate_workout(steps, rider, bike, course, time_resolution_s=5.0)
-        self._last_workout_result = result
-
-        mins = int(result.total_time_s // 60)
-        secs = int(result.total_time_s % 60)
-        imp = self._imperial
-        su = _speed_unit(imp)
-        du = _dist_unit(imp)
-        dist_val = _convert_dist_km(result.total_distance_m / 1000, imp)
-        avg_spd = _convert_speed(result.avg_speed_kmh, imp)
-        summary = (
-            f"Total Time: {mins}:{secs:02d}\n"
-            f"Distance: {dist_val:.2f} {du}\n"
-            f"Avg Speed: {avg_spd:.1f} {su}\n"
-            f"Avg Power: {result.avg_power_watts:.0f} W\n"
-            f"Work: {result.total_work_kj:.0f} kJ\n"
-            f"Calories: {result.total_calories_kcal:.0f} kcal"
-        )
-        self.lbl_workout_summary.configure(text=summary)
-        self._update_workout_charts(result)
-
-    def _update_workout_charts(self, result: Any) -> None:
-        t = self._theme
-        imp = self._imperial
-        su = _speed_unit(imp)
-        times_min = [pt.time_s / 60.0 for pt in result.points]
-        powers = [pt.power_watts for pt in result.points]
-        speeds = [_convert_speed(pt.speed_kmh, imp) for pt in result.points]
-
-        ftp = self.var_ftp.get()
-        zones = power_zones(ftp)
-
-        ax1 = self.ax_workout_power
-        ax1.clear()
-        _style_ax(ax1, t)
-
-        for name, lo, hi, color in zones:
-            if hi > 3000:
-                hi = max(powers) * 1.1 if powers else 500
-            ax1.axhspan(lo, hi, alpha=0.10, color=color)
-
-        for i in range(len(times_min) - 1):
-            _, color = zone_for_power(powers[i], ftp)
-            ax1.fill_between(
-                [times_min[i], times_min[i + 1]],
-                [powers[i], powers[i + 1]],
-                alpha=0.6, color=color
-            )
-        ax1.plot(times_min, powers, color=t["FG"], linewidth=0.5, alpha=0.5)
-        ax1.set_xlabel("Time (min)", color=t["FG"], fontsize=9)
-        ax1.set_ylabel("Power (W)", color=t["FG"], fontsize=9)
-        ax1.set_title("Workout Power Profile", color=t["FG"], fontsize=11, fontweight="bold")
-
-        ax2 = self.ax_workout_speed
-        ax2.clear()
-        _style_ax(ax2, t)
-        ax2.plot(times_min, speeds, color=t["ACCENT"], linewidth=1.5)
-        ax2.fill_between(times_min, speeds, alpha=0.2, color=t["ACCENT"])
-        ax2.set_xlabel("Time (min)", color=t["FG"], fontsize=9)
-        ax2.set_ylabel(f"Speed ({su})", color=t["FG"], fontsize=9)
-        ax2.set_title("Speed Over Time", color=t["FG"], fontsize=11, fontweight="bold")
-
-        self.canvas_workout.draw_idle()
-
-    # ==================================================================
-    # TAB 4: Compare Scenarios
-    # ==================================================================
-    def _build_compare_tab(self) -> None:
-        tab = ttk.Frame(self._notebook)
-        self._notebook.add(tab, text="  \u2696 Compare  ")
-
-        top = ttk.Frame(tab)
-        top.pack(fill=tk.X, padx=8, pady=4)
-
-        ttk.Button(top, text="Snapshot Current Config",
-                   command=self._snapshot_scenario).pack(side=tk.LEFT, padx=4)
-        ttk.Button(top, text="Clear All", style="Secondary.TButton",
-                   command=self._clear_scenarios).pack(side=tk.LEFT, padx=4)
-
-        self._compare_tree = ttk.Treeview(
-            tab, columns=("power", "weight", "grade", "wind", "speed"),
-            show="headings", height=6,
-        )
-        for col, hd, w in [("power", "Power (W)", 80), ("weight", "Weight (kg)", 80),
-                           ("grade", "Grade (%)", 80), ("wind", "Wind (km/h)", 80),
-                           ("speed", "Speed (km/h)", 100)]:
-            self._compare_tree.heading(col, text=hd)
-            self._compare_tree.column(col, width=w, anchor=tk.CENTER)
-        self._compare_tree.pack(fill=tk.X, padx=8, pady=4)
-
-        t = self._theme
-        self.fig_compare = Figure(figsize=(7, 4), dpi=100, facecolor=t["BG"])
-        self.fig_compare.subplots_adjust(left=0.10, right=0.95, top=0.92, bottom=0.18)
-        self.ax_compare = self.fig_compare.add_subplot(111)
-        self.canvas_compare = FigureCanvasTkAgg(self.fig_compare, master=tab)
-        self.canvas_compare.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8)
-
-    def _snapshot_scenario(self) -> None:
-        rider, bike, course = self._gather_params()
-        result = solve_speed(rider, bike, course)
-        name = f"Scenario {len(self._scenarios) + 1}"
-        self._scenarios.append((name, rider, bike, course, result))
-
-        speed_val = _convert_speed(result.speed_kmh, self._imperial)
-        self._compare_tree.insert("", tk.END, values=(
-            f"{rider.power_watts:.0f}", f"{rider.weight_kg:.1f}",
-            f"{course.grade_pct:.1f}", f"{course.headwind_kmh:.0f}",
-            f"{speed_val:.1f}",
-        ))
-        self._update_compare_chart()
-
-    def _clear_scenarios(self) -> None:
-        self._scenarios.clear()
-        for item in self._compare_tree.get_children():
-            self._compare_tree.delete(item)
-        self.ax_compare.clear()
-        self.canvas_compare.draw_idle()
-
-    def _refresh_compare_tree(self) -> None:
-        """Re-populate the compare treeview with current units."""
-        su = _speed_unit(self._imperial)
-        self._compare_tree.heading("speed", text=f"Speed ({su})")
-        for item in self._compare_tree.get_children():
-            self._compare_tree.delete(item)
-        for name, rider, bike, course, result in self._scenarios:
-            speed_val = _convert_speed(result.speed_kmh, self._imperial)
-            self._compare_tree.insert("", tk.END, values=(
-                f"{rider.power_watts:.0f}", f"{rider.weight_kg:.1f}",
-                f"{course.grade_pct:.1f}", f"{course.headwind_kmh:.0f}",
-                f"{speed_val:.1f}",
-            ))
-
-    def _update_compare_chart(self) -> None:
-        t = self._theme
-        imp = self._imperial
-        su = _speed_unit(imp)
-        ax = self.ax_compare
-        ax.clear()
-        _style_ax(ax, t)
-
-        chart_colors = [t[k] for k in CHART_COLOURS_KEYS]
-        names = [s[0] for s in self._scenarios]
-        speeds = [_convert_speed(s[4].speed_kmh, imp) for s in self._scenarios]
-        colors = [chart_colors[i % len(chart_colors)] for i in range(len(names))]
-
-        bars = ax.bar(names, speeds, color=colors, edgecolor=t["BORDER"],
-                      alpha=0.85, width=0.6)
-        for bar, spd in zip(bars, speeds):
-            ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.5,
-                    f"{spd:.1f}", ha="center", va="bottom", color=t["FG"], fontsize=8)
-
-        ax.set_ylabel(f"Speed ({su})", color=t["FG"], fontsize=9)
-        ax.set_title("Scenario Comparison", color=t["FG"], fontsize=11, fontweight="bold")
-
-        self.canvas_compare.draw_idle()
-
-    # ==================================================================
-    # TAB 5: W/kg Analysis
-    # ==================================================================
-    def _build_pw_ratio_tab(self) -> None:
-        tab = ttk.Frame(self._notebook)
-        self._notebook.add(tab, text="  \U0001f4aa W/kg  ")
-
-        left = ttk.Frame(tab)
-        left.pack(side=tk.LEFT, fill=tk.BOTH, padx=8, pady=4)
-
-        right = ttk.Frame(tab)
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=4)
-
-        info = ttk.LabelFrame(left, text="Power-to-Weight Analysis",
-                               style="Card.TLabelframe")
-        info.pack(fill=tk.X, pady=(0, 6))
-
-        ttk.Button(info, text="Analyze Current Settings",
-                   command=self._run_pw_analysis).pack(fill=tk.X, padx=8, pady=6)
-
-        res_card = ttk.Frame(info, style="MetricCard.TFrame")
-        res_card.pack(fill=tk.X, padx=8, pady=(0, 6))
-
-        ttk.Label(res_card, text="W/kg Ratio:", style="Card.TLabel").pack(padx=8, anchor=tk.W, pady=(6, 0))
-        self.lbl_pw_ratio = ttk.Label(res_card, text="0.00",
-                                       font=("Helvetica", 28, "bold"),
-                                       foreground=self._theme["ACCENT"],
-                                       background=self._theme["CARD_BG"])
-        self.lbl_pw_ratio.pack(padx=8, anchor=tk.W)
-
-        ttk.Label(res_card, text="Category:", style="Card.TLabel").pack(padx=8, anchor=tk.W, pady=(4, 0))
-        self.lbl_pw_category = ttk.Label(res_card, text="",
-                                          font=("Helvetica", 14, "bold"),
-                                          foreground=self._theme["ACCENT2"],
-                                          background=self._theme["CARD_BG"])
-        self.lbl_pw_category.pack(padx=8, anchor=tk.W, pady=(0, 6))
-
-        self.lbl_pw_details = ttk.Label(info, text="", style="Small.TLabel",
-                                         wraplength=280, justify=tk.LEFT)
-        self.lbl_pw_details.pack(padx=8, pady=4)
-
-        t = self._theme
-        self.fig_pw = Figure(figsize=(7, 5), dpi=100, facecolor=t["BG"])
-        self.fig_pw.subplots_adjust(hspace=0.40, left=0.12, right=0.95,
-                                     top=0.94, bottom=0.10)
-        self.ax_pw_bar = self.fig_pw.add_subplot(211)
-        self.ax_pw_curve = self.fig_pw.add_subplot(212)
-        self.canvas_pw = FigureCanvasTkAgg(self.fig_pw, master=right)
-        self.canvas_pw.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-
-    def _run_pw_analysis(self) -> None:
-        ftp = self.var_ftp.get()
-        weight = self.var_rider_weight.get()
-        analysis = w_per_kg_analysis(ftp, weight)
-
-        w_kg = analysis["w_per_kg"]
-        category = analysis["category"]
-
-        self.lbl_pw_ratio.configure(text=f"{w_kg:.2f}")
-        self.lbl_pw_category.configure(text=category)
-
-        details = (
-            f"FTP: {ftp:.0f} W\n"
-            f"Weight: {weight:.1f} kg\n"
-            f"W/kg: {w_kg:.2f}\n\n"
-            f"Category: {category}"
-        )
-        self.lbl_pw_details.configure(text=details)
-        self._update_pw_charts(w_kg, ftp, weight)
-
-    def _update_pw_charts(self, w_kg: float, ftp: float, weight: float) -> None:
-        t = self._theme
-        chart_colors = [t[k] for k in CHART_COLOURS_KEYS]
-
-        ax1 = self.ax_pw_bar
-        ax1.clear()
-        _style_ax(ax1, t)
-
-        cat_names = [c[0] for c in RIDER_CATEGORIES]
-        cat_ranges = [(c[1], min(c[2], 8.0)) for c in RIDER_CATEGORIES]
-        colors = []
-        for c_name in cat_names:
-            if c_name == classify_rider(w_kg):
-                colors.append(t["ACCENT2"])
-            else:
-                colors.append(t["ACCENT"])
-
-        cat_names_rev = list(reversed(cat_names))
-        bottoms = [c[0] for c in reversed(cat_ranges)]
-        heights = [c[1] - c[0] for c in reversed(cat_ranges)]
-        colors_rev = list(reversed(colors))
-
-        bars = ax1.barh(cat_names_rev, heights, left=bottoms,
-                        color=colors_rev, edgecolor=t["BORDER"], alpha=0.8)
-        ax1.axvline(w_kg, color=t["ACCENT4"], linewidth=2, linestyle="--",
-                    label=f"You: {w_kg:.2f} W/kg")
-        ax1.set_xlabel("W/kg", color=t["FG"], fontsize=9)
-        ax1.set_title("Rider Classification", color=t["FG"],
-                      fontsize=11, fontweight="bold")
-        ax1.legend(fontsize=8, facecolor=t["BG_LIGHT"], edgecolor=t["BORDER"],
-                   labelcolor=t["FG"])
-
-        ax2 = self.ax_pw_curve
-        ax2.clear()
-        _style_ax(ax2, t)
-
-        weights = list(range(50, 110))
-        w_per_kgs = [ftp / w for w in weights]
-        ax2.plot(weights, w_per_kgs, color=t["ACCENT"], linewidth=2)
-        ax2.axvline(weight, color=t["ACCENT4"], linestyle="--", linewidth=1,
-                    label=f"Your weight: {weight:.0f} kg")
-        ax2.axhline(w_kg, color=t["ACCENT2"], linestyle=":", linewidth=1,
-                    alpha=0.7, label=f"Your W/kg: {w_kg:.2f}")
-
-        for name, lo, hi in RIDER_CATEGORIES:
-            if hi == float("inf"):
-                hi = 8.0
-            ax2.axhspan(lo, hi, alpha=0.06, color=t["ACCENT3"])
-
-        ax2.fill_between(weights, w_per_kgs, alpha=0.15, color=t["ACCENT"])
-        ax2.set_xlabel("Rider Weight (kg)", color=t["FG"], fontsize=9)
-        ax2.set_ylabel("W/kg at current FTP", color=t["FG"], fontsize=9)
-        ax2.set_title(f"W/kg vs Weight (FTP={ftp:.0f}W)", color=t["FG"],
-                      fontsize=11, fontweight="bold")
-        ax2.legend(fontsize=8, facecolor=t["BG_LIGHT"], edgecolor=t["BORDER"],
-                   labelcolor=t["FG"])
-
-        self.canvas_pw.draw_idle()
-
-    # ==================================================================
-    # TAB 6: Race Simulation
-    # ==================================================================
-    def _build_race_tab(self) -> None:
-        tab = ttk.Frame(self._notebook)
-        self._notebook.add(tab, text="  \U0001f3c1 Race  ")
-
-        left = ttk.Frame(tab)
-        left.pack(side=tk.LEFT, fill=tk.BOTH, padx=8, pady=4)
-
-        right = ttk.Frame(tab)
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=4)
-
-        comp_frame = ttk.LabelFrame(left, text="Competitors", style="Card.TLabelframe")
-        comp_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
-
-        btn_row = ttk.Frame(comp_frame, style="Card.TFrame")
-        btn_row.pack(fill=tk.X, padx=6, pady=4)
-        ttk.Button(btn_row, text="+ Rider", style="Preset.TButton",
-                   command=self._add_race_competitor).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_row, text="+ Me", style="Preset.TButton",
-                   command=self._add_me_as_competitor).pack(side=tk.LEFT, padx=2)
-        ttk.Button(btn_row, text="\u2212 Selected", style="Preset.TButton",
-                   command=self._remove_race_competitor).pack(side=tk.LEFT, padx=2)
-
-        self._race_competitors: list[RaceCompetitor] = []
-        self._race_listbox = tk.Listbox(comp_frame, bg=self._theme["ENTRY_BG"],
-                                         fg=self._theme["FG"], height=8,
-                                         selectmode=tk.SINGLE,
-                                         font=("Helvetica", 9), relief="flat", bd=0,
-                                         highlightthickness=1,
-                                         highlightcolor=self._theme["ACCENT"])
-        self._race_listbox.pack(fill=tk.BOTH, expand=True, padx=6, pady=4)
-
-        self._race_competitors = [
-            RaceCompetitor("You", 250, 75, 178, 8.0),
-            RaceCompetitor("Strong Rider", 300, 72, 175, 7.5,
-                           position=RidingPosition.DROPS),
-            RaceCompetitor("TT Specialist", 320, 78, 182, 8.0,
-                           position=RidingPosition.AEROBARS),
-            RaceCompetitor("Climber", 260, 60, 170, 6.5,
-                           tire_type=TireType.ROAD_RACING),
-        ]
-        self._refresh_race_listbox()
-
-        btn_row2 = ttk.Frame(comp_frame, style="Card.TFrame")
-        btn_row2.pack(fill=tk.X, padx=6, pady=4)
-        ttk.Button(btn_row2, text="\u25b6 Run Race",
-                   command=self._run_race).pack(side=tk.RIGHT, padx=2)
-
-        self.lbl_race_results = ttk.Label(left, text="", style="Small.TLabel",
-                                           wraplength=300, justify=tk.LEFT)
-        self.lbl_race_results.pack(fill=tk.X, pady=4)
-
-        t = self._theme
-        self.fig_race = Figure(figsize=(7, 5), dpi=100, facecolor=t["BG"])
-        self.fig_race.subplots_adjust(hspace=0.40, left=0.10, right=0.95,
-                                       top=0.94, bottom=0.14)
-        self.ax_race_speed = self.fig_race.add_subplot(211)
-        self.ax_race_time = self.fig_race.add_subplot(212)
-        self.canvas_race = FigureCanvasTkAgg(self.fig_race, master=right)
-        self.canvas_race.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-
-    def _refresh_race_listbox(self) -> None:
-        self._race_listbox.delete(0, tk.END)
-        for c in self._race_competitors:
-            w_kg = power_to_weight_ratio(c.power_watts, c.weight_kg)
-            self._race_listbox.insert(
-                tk.END,
-                f"  {c.name}: {c.power_watts:.0f}W / {c.weight_kg:.0f}kg "
-                f"({w_kg:.1f} W/kg)"
-            )
-
-    def _add_race_competitor(self) -> None:
-        name = simpledialog.askstring("Competitor", "Name:", parent=self)
-        if not name:
-            return
-        power = simpledialog.askfloat("Competitor", "Power (W):",
-                                       initialvalue=250, parent=self)
-        weight = simpledialog.askfloat("Competitor", "Weight (kg):",
-                                        initialvalue=75, parent=self)
-        if power is None or weight is None:
-            return
-        self._race_competitors.append(
-            RaceCompetitor(name, power, weight)
-        )
-        self._refresh_race_listbox()
-
-    def _add_me_as_competitor(self) -> None:
-        rider, bike, _ = self._gather_params()
-        ftp = self.var_ftp.get()
-        comp = RaceCompetitor(
-            name="You",
-            power_watts=ftp,
-            weight_kg=rider.weight_kg,
-            height_cm=rider.height_cm,
-            bike_weight_kg=bike.weight_kg,
-            tire_type=bike.tire_type,
-            position=bike.position,
-            drivetrain_efficiency=bike.drivetrain_efficiency,
-        )
-        self._race_competitors.append(comp)
-        self._refresh_race_listbox()
-
-    def _remove_race_competitor(self) -> None:
-        sel = self._race_listbox.curselection()
-        if sel:
-            self._race_competitors.pop(sel[0])
-            self._refresh_race_listbox()
-
-    def _run_race(self) -> None:
-        if not self._race_competitors:
-            messagebox.showwarning("No Competitors", "Add at least one competitor.")
-            return
-
-        segments: list[CourseSegment] = []
-        for sv in self._course_segments:
-            try:
-                segments.append(CourseSegment(
-                    distance_m=sv["distance"].get(),
-                    grade_pct=sv["grade"].get(),
-                    headwind_kmh=sv["wind"].get(),
-                    wind_direction_deg=sv["wind_dir"].get(),
-                    elevation_m=sv["elevation"].get(),
-                    temperature_c=sv["temperature"].get(),
-                ))
-            except (tk.TclError, ValueError):
-                pass
-
-        if not segments:
-            segments = [
-                CourseSegment(distance_m=5000, grade_pct=0),
-                CourseSegment(distance_m=2000, grade_pct=5),
-                CourseSegment(distance_m=3000, grade_pct=-3),
-                CourseSegment(distance_m=5000, grade_pct=0),
-                CourseSegment(distance_m=1000, grade_pct=8),
-                CourseSegment(distance_m=4000, grade_pct=-2),
-            ]
-
-        race_results = simulate_race(self._race_competitors, segments)
-
-        imp = self._imperial
-        su = _speed_unit(imp)
-        result_text = "Race Results:\n"
-        for i, r in enumerate(race_results):
-            mins = int(r.total_time_s // 60)
-            secs = int(r.total_time_s % 60)
-            gap = f"+{r.gap_to_leader_s:.1f}s" if r.gap_to_leader_s > 0 else "Leader"
-            avg_spd = _convert_speed(r.avg_speed_kmh, imp)
-            result_text += (
-                f"  {i+1}. {r.name}: {mins}:{secs:02d} "
-                f"({avg_spd:.1f} {su}) {gap}\n"
-            )
-        self.lbl_race_results.configure(text=result_text.strip())
-        self._update_race_charts(race_results, segments)
-
-    def _update_race_charts(self, race_results: list, segments: list) -> None:
-        t = self._theme
-        imp = self._imperial
-        su = _speed_unit(imp)
-        du = _dist_unit(imp)
-        chart_colors = [t[k] for k in CHART_COLOURS_KEYS]
-
-        ax1 = self.ax_race_speed
-        ax1.clear()
-        _style_ax(ax1, t)
-
-        total_dist = sum(s.distance_m for s in segments)
-        for i, r in enumerate(race_results):
-            color = chart_colors[i % len(chart_colors)]
-            mid_d = []
-            cum = 0.0
-            for j, seg in enumerate(segments):
-                mid_d.append(_convert_dist_km((cum + seg.distance_m / 2) / 1000, imp))
-                cum += seg.distance_m
-            seg_speeds = [_convert_speed(s, imp) for s in r.segment_speeds]
-            ax1.plot(mid_d, seg_speeds, color=color, linewidth=1.5,
-                     marker="o", markersize=4, label=r.name)
-
-        ax1.set_xlabel(f"Distance ({du})", color=t["FG"], fontsize=9)
-        ax1.set_ylabel(f"Speed ({su})", color=t["FG"], fontsize=9)
-        ax1.set_title("Speed by Segment", color=t["FG"], fontsize=11,
-                      fontweight="bold")
-        ax1.legend(fontsize=7, facecolor=t["BG_LIGHT"], edgecolor=t["BORDER"],
-                   labelcolor=t["FG"], loc="best")
-
-        ax2 = self.ax_race_time
-        ax2.clear()
-        _style_ax(ax2, t)
-
-        names = [r.name for r in race_results]
-        times = [r.total_time_s for r in race_results]
-        colors = [chart_colors[i % len(chart_colors)]
-                  for i in range(len(race_results))]
-
-        bars = ax2.barh(names, times, color=colors, edgecolor=t["BORDER"],
-                        alpha=0.85)
-        for bar, r in zip(bars, race_results):
-            mins = int(r.total_time_s // 60)
-            secs = int(r.total_time_s % 60)
-            gap_txt = (f" (+{r.gap_to_leader_s:.1f}s)"
-                       if r.gap_to_leader_s > 0 else " (Leader)")
-            ax2.text(bar.get_width() + max(times) * 0.01,
-                     bar.get_y() + bar.get_height() / 2,
-                     f"{mins}:{secs:02d}{gap_txt}",
-                     va="center", color=t["FG"], fontsize=8)
-
-        ax2.set_xlabel("Time (s)", color=t["FG"], fontsize=9)
-        ax2.set_title("Race Standings", color=t["FG"], fontsize=11,
-                      fontweight="bold")
-
-        self.canvas_race.draw_idle()
-
-    # ==================================================================
     # TAB 7: 3D Course Visualization & Gradient Map
     # ==================================================================
     def _build_3d_tab(self) -> None:
@@ -1754,152 +1144,6 @@ class BikeSimApp(tk.Tk):
         ax.set_aspect("equal")
 
         self.canvas_3d.draw_idle()
-
-    # ==================================================================
-    # TAB 8: Critical Power Model (CP & W')
-    # ==================================================================
-    def _build_cp_tab(self) -> None:
-        tab = ttk.Frame(self._notebook)
-        self._notebook.add(tab, text="  \u26a1 CP / W'  ")
-
-        left = ttk.Frame(tab)
-        left.pack(side=tk.LEFT, fill=tk.BOTH, padx=8, pady=4)
-
-        right = ttk.Frame(tab)
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=8, pady=4)
-
-        est_frame = ttk.LabelFrame(left, text="Estimate from FTP",
-                                    style="Card.TLabelframe")
-        est_frame.pack(fill=tk.X, pady=(0, 6))
-
-        ttk.Label(est_frame, text="Uses your current FTP slider value",
-                  style="Small.TLabel").pack(padx=8, pady=2)
-        ttk.Button(est_frame, text="Estimate CP from FTP",
-                   command=self._estimate_cp).pack(fill=tk.X, padx=8, pady=4)
-
-        fit_frame = ttk.LabelFrame(left, text="Fit from Two Efforts",
-                                    style="Card.TLabelframe")
-        fit_frame.pack(fill=tk.X, pady=(0, 6))
-
-        self.var_cp_power1 = tk.DoubleVar(value=350)
-        self.var_cp_dur1 = tk.DoubleVar(value=300)
-        self.var_cp_power2 = tk.DoubleVar(value=280)
-        self.var_cp_dur2 = tk.DoubleVar(value=1200)
-
-        r1 = ttk.Frame(fit_frame, style="Card.TFrame")
-        r1.pack(fill=tk.X, padx=8, pady=2)
-        _label(r1, "Effort 1: Power (W)", style="Card.TLabel").pack(side=tk.LEFT)
-        ttk.Entry(r1, textvariable=self.var_cp_power1, width=6).pack(side=tk.RIGHT)
-
-        r2 = ttk.Frame(fit_frame, style="Card.TFrame")
-        r2.pack(fill=tk.X, padx=8, pady=2)
-        _label(r2, "Effort 1: Duration (s)", style="Card.TLabel").pack(side=tk.LEFT)
-        ttk.Entry(r2, textvariable=self.var_cp_dur1, width=6).pack(side=tk.RIGHT)
-
-        r3 = ttk.Frame(fit_frame, style="Card.TFrame")
-        r3.pack(fill=tk.X, padx=8, pady=2)
-        _label(r3, "Effort 2: Power (W)", style="Card.TLabel").pack(side=tk.LEFT)
-        ttk.Entry(r3, textvariable=self.var_cp_power2, width=6).pack(side=tk.RIGHT)
-
-        r4 = ttk.Frame(fit_frame, style="Card.TFrame")
-        r4.pack(fill=tk.X, padx=8, pady=2)
-        _label(r4, "Effort 2: Duration (s)", style="Card.TLabel").pack(side=tk.LEFT)
-        ttk.Entry(r4, textvariable=self.var_cp_dur2, width=6).pack(side=tk.RIGHT)
-
-        ttk.Button(fit_frame, text="Fit CP Model",
-                   command=self._fit_cp).pack(fill=tk.X, padx=8, pady=4)
-
-        res_frame = ttk.LabelFrame(left, text="Results", style="Card.TLabelframe")
-        res_frame.pack(fill=tk.X, pady=(0, 6))
-        self.lbl_cp_result = ttk.Label(res_frame, text="", style="Small.TLabel",
-                                        wraplength=280, justify=tk.LEFT)
-        self.lbl_cp_result.pack(padx=8, pady=4)
-
-        t = self._theme
-        self.fig_cp = Figure(figsize=(7, 5), dpi=100, facecolor=t["BG"])
-        self.fig_cp.subplots_adjust(hspace=0.40, left=0.12, right=0.95,
-                                     top=0.94, bottom=0.12)
-        self.ax_cp_curve = self.fig_cp.add_subplot(211)
-        self.ax_cp_tte = self.fig_cp.add_subplot(212)
-        self.canvas_cp = FigureCanvasTkAgg(self.fig_cp, master=right)
-        self.canvas_cp.get_tk_widget().pack(fill=tk.BOTH, expand=True)
-
-    def _estimate_cp(self) -> None:
-        ftp = self.var_ftp.get()
-        model = estimate_cp_from_ftp(ftp)
-        self._display_cp_model(model)
-
-    def _fit_cp(self) -> None:
-        try:
-            model = fit_cp_model(
-                self.var_cp_power1.get(), self.var_cp_dur1.get(),
-                self.var_cp_power2.get(), self.var_cp_dur2.get(),
-            )
-            self._display_cp_model(model)
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
-
-    def _display_cp_model(self, model: CriticalPowerModel) -> None:
-        t = self._theme
-
-        tte_300 = model.time_to_exhaustion(300)
-        tte_400 = model.time_to_exhaustion(400)
-        tte_str = lambda t_s: f"{t_s:.0f}s" if t_s < float("inf") else "unlimited"
-
-        result_text = (
-            f"Critical Power (CP): {model.cp_watts:.0f} W\n"
-            f"W' (anaerobic capacity): {model.w_prime_joules/1000:.1f} kJ\n\n"
-            f"Max 1-min power: {model.max_power_for_duration(60):.0f} W\n"
-            f"Max 5-min power: {model.max_power_for_duration(300):.0f} W\n"
-            f"Max 20-min power: {model.max_power_for_duration(1200):.0f} W\n"
-            f"Max 60-min power: {model.max_power_for_duration(3600):.0f} W\n\n"
-            f"TTE at 300W: {tte_str(tte_300)}\n"
-            f"TTE at 400W: {tte_str(tte_400)}"
-        )
-        self.lbl_cp_result.configure(text=result_text)
-
-        durations, powers = model.power_curve()
-
-        ax1 = self.ax_cp_curve
-        ax1.clear()
-        _style_ax(ax1, t)
-
-        duration_mins = [d / 60 for d in durations]
-        ax1.plot(duration_mins, powers, color=t["ACCENT"], linewidth=2.5,
-                 marker="o", markersize=4)
-        ax1.axhline(model.cp_watts, color=t["ACCENT4"], linestyle="--",
-                    linewidth=1.5, label=f"CP = {model.cp_watts:.0f} W")
-        ax1.fill_between(duration_mins, [model.cp_watts] * len(duration_mins),
-                         powers, alpha=0.15, color=t["ACCENT3"],
-                         label=f"W' = {model.w_prime_joules/1000:.1f} kJ")
-        ax1.set_xlabel("Duration (min)", color=t["FG"], fontsize=9)
-        ax1.set_ylabel("Power (W)", color=t["FG"], fontsize=9)
-        ax1.set_title("Power-Duration Curve", color=t["FG"],
-                      fontsize=11, fontweight="bold")
-        ax1.legend(fontsize=8, facecolor=t["BG_LIGHT"], edgecolor=t["BORDER"],
-                   labelcolor=t["FG"])
-        ax1.set_xscale("log")
-
-        ax2 = self.ax_cp_tte
-        ax2.clear()
-        _style_ax(ax2, t)
-
-        test_powers = list(range(int(model.cp_watts) + 10,
-                                  int(model.cp_watts) + 250, 10))
-        ttes = [model.time_to_exhaustion(p) / 60 for p in test_powers]
-
-        ax2.plot(test_powers, ttes, color=t["ACCENT2"], linewidth=2)
-        ax2.fill_between(test_powers, ttes, alpha=0.1, color=t["ACCENT2"])
-        ax2.axvline(model.cp_watts, color=t["ACCENT4"], linestyle="--",
-                    linewidth=1, alpha=0.7, label=f"CP = {model.cp_watts:.0f} W")
-        ax2.set_xlabel("Power (W)", color=t["FG"], fontsize=9)
-        ax2.set_ylabel("Time to Exhaustion (min)", color=t["FG"], fontsize=9)
-        ax2.set_title("Time to Exhaustion", color=t["FG"],
-                      fontsize=11, fontweight="bold")
-        ax2.legend(fontsize=8, facecolor=t["BG_LIGHT"], edgecolor=t["BORDER"],
-                   labelcolor=t["FG"])
-
-        self.canvas_cp.draw_idle()
 
     # ==================================================================
     # TAB 9: Route Optimization (Pacing Strategy)
@@ -3093,8 +2337,6 @@ class BikeSimApp(tk.Tk):
         buttons = [
             ("Export Current Result to CSV", self._export_result_csv),
             ("Export Course Profile to CSV", self._export_course_csv),
-            ("Export Comparison to CSV", self._export_comparison),
-            ("Export Workout to CSV", self._export_workout_csv),
             ("Generate PDF Report", self._export_pdf),
         ]
         for text, cmd in buttons:
@@ -3119,26 +2361,6 @@ class BikeSimApp(tk.Tk):
         if path:
             export_course_csv(self._last_course_result, path)
             messagebox.showinfo("Exported", f"Course profile saved to {path}")
-
-    def _export_workout_csv(self) -> None:
-        if not hasattr(self, "_last_workout_result"):
-            messagebox.showwarning("No Data", "Run a workout first.")
-            return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".csv", filetypes=[("CSV", "*.csv")])
-        if path:
-            export_workout_csv(self._last_workout_result, path)
-            messagebox.showinfo("Exported", f"Workout saved to {path}")
-
-    def _export_comparison(self) -> None:
-        if not self._scenarios:
-            messagebox.showwarning("No Data", "Snapshot at least one scenario first.")
-            return
-        path = filedialog.asksaveasfilename(
-            defaultextension=".csv", filetypes=[("CSV", "*.csv")])
-        if path:
-            export_comparison_csv(self._scenarios, path)
-            messagebox.showinfo("Exported", f"Comparison saved to {path}")
 
     def _export_pdf(self) -> None:
         path = filedialog.asksaveasfilename(
@@ -3326,11 +2548,6 @@ class BikeSimApp(tk.Tk):
         # Re-render other tabs that have cached data
         if self._last_course_result:
             self._run_course_profile()
-        if hasattr(self, '_last_workout_result'):
-            self._run_workout()
-        if self._scenarios:
-            self._refresh_compare_tree()
-            self._update_compare_chart()
 
     # ------------------------------------------------------------------
     # Presets
