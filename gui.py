@@ -1840,13 +1840,16 @@ class BikeSimApp(tk.Tk):
         self._run_ride_analysis()
 
     def _run_ride_analysis(self) -> None:
-        rider, bike, _ = self._gather_params()
+        rider, bike, course = self._gather_params()
         rider.power_watts = self.var_ride_power.get()
 
         try:
             analysis = analyze_ride(
                 self._ride_points, rider, bike,
                 smoothing_window=self.var_smoothing.get(),
+                temperature_c=course.temperature_c,
+                headwind_kmh=course.headwind_kmh,
+                wind_direction_deg=course.wind_direction_deg,
             )
         except ValueError as e:
             messagebox.showwarning("Analysis Error", str(e))
@@ -2068,6 +2071,7 @@ class BikeSimApp(tk.Tk):
             return
 
         results = what_if_analysis(rider, bike, segments, changes)
+        self._last_whatif_results = results
         self._display_whatif_results(results)
 
     def _get_whatif_segments(self) -> list[CourseSegment]:
@@ -2077,8 +2081,9 @@ class BikeSimApp(tk.Tk):
                 distance_m=sv["distance"].get(),
                 grade_pct=sv["grade"].get(),
                 headwind_kmh=sv["wind"].get(),
+                wind_direction_deg=sv["wind_dir"].get(),
                 elevation_m=sv["elevation"].get(),
-                temperature_c=sv["temp"].get(),
+                temperature_c=sv["temperature"].get(),
             ))
         return segments
 
@@ -2191,7 +2196,10 @@ class BikeSimApp(tk.Tk):
 
         rider, bike, _ = self._gather_params()
         prediction = predict_kom(rider, bike, segments)
+        self._last_kom_prediction = prediction
+        self._display_kom_results(prediction)
 
+    def _display_kom_results(self, prediction: Any) -> None:
         imp = self._imperial
         su = _speed_unit(imp)
 
@@ -2548,6 +2556,12 @@ class BikeSimApp(tk.Tk):
         # Re-render other tabs that have cached data
         if self._last_course_result:
             self._run_course_profile()
+        if self._ride_analysis is not None:
+            self._run_ride_analysis()
+        if hasattr(self, '_last_whatif_results') and self._last_whatif_results:
+            self._display_whatif_results(self._last_whatif_results)
+        if hasattr(self, '_last_kom_prediction') and self._last_kom_prediction:
+            self._display_kom_results(self._last_kom_prediction)
 
     # ------------------------------------------------------------------
     # Presets

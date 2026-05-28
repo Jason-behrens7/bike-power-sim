@@ -1683,11 +1683,15 @@ def analyze_ride(
     rider: RiderParams,
     bike: BikeParams,
     smoothing_window: int = 5,
+    temperature_c: float = 20.0,
+    headwind_kmh: float = 0.0,
+    wind_direction_deg: float = 0.0,
 ) -> RideAnalysis:
     """Compare actual ride data against model predictions.
 
     For each point, predicts speed using the simulation model at the
     point's grade and elevation, then computes error metrics.
+    Uses the same physics as Live Ride (solve_speed with power_override).
     """
     if len(points) < 2:
         raise ValueError("Need at least 2 ride points for analysis")
@@ -1713,13 +1717,11 @@ def analyze_ride(
         course = CourseParams(
             grade_pct=smoothed_grades[i],
             elevation_m=pt.elevation_m,
+            temperature_c=temperature_c,
+            headwind_kmh=headwind_kmh,
+            wind_direction_deg=wind_direction_deg,
         )
-        rider_copy = RiderParams(
-            power_watts=power,
-            weight_kg=rider.weight_kg,
-            height_cm=rider.height_cm,
-        )
-        pred = solve_speed(rider_copy, bike, course)
+        pred = solve_speed(rider, bike, course, power_override=power)
 
         actual_speeds.append(pt.speed_kmh)
         predicted_speeds.append(pred.speed_kmh)
