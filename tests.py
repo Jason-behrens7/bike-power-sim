@@ -62,6 +62,15 @@ from simulation import (
     what_if_analysis,
     wheel_inertia_factor,
     zone_for_power,
+    # Race Planner
+    MCVariable,
+    OptimizeVariable,
+    PLANNER_PARAMS,
+    monte_carlo_simulation,
+    optimize_setup,
+    planner_base_value,
+    sweep_1d,
+    sweep_2d,
     # Unit conversions
     kg_to_lbs, lbs_to_kg,
     cm_to_inches, inches_to_cm,
@@ -1172,6 +1181,177 @@ class TestKOMPrediction(unittest.TestCase):
         result = predict_kom(self.rider, self.bike, self.segments)
         uphill_seg = result.segments[0]  # 5% grade
         self.assertGreater(uphill_seg.elevation_gain_m, 0)
+
+
+class TestRacePlanner(unittest.TestCase):
+    def setUp(self) -> None:
+        self.rider = RiderParams(power_watts=250, weight_kg=75, height_cm=178)
+        self.bike = BikeParams()
+        self.segments = [
+            CourseSegment(distance_m=2000, grade_pct=5, elevation_m=100),
+            CourseSegment(distance_m=2000, grade_pct=-3, elevation_m=200),
+            CourseSegment(distance_m=2000, grade_pct=0, headwind_kmh=10,
+                          elevation_m=150),
+        ]
+
+    # ---- base value & metadata ----
+    def test_planner_base_values(self) -> None:
+        self.assertEqual(
+            planner_base_value(self.rider, self.bike, self.segments, "power_watts"),
+            250)
+        self.assertEqual(
+            planner_base_value(self.rider, self.bike, self.segments, "weight_kg"),
+            75)
+        # course wind is averaged across segments (0, 0, 10) -> 10/3
+        self.assertAlmostEqual(
+            planner_base_value(self.rider, self.bike, self.segments, "headwind_kmh"),
+            10.0 / 3.0, places=4)
+        self.assertGreater(
+            planner_base_value(self.rider, self.bike, self.segments, "cda"), 0)
+        self.assertGreater(
+            planner_base_value(self.rider, self.bike, self.segments, "crr"), 0)
+
+    def test_planner_params_registry(self) -> None:
+        for key in ["power_watts", "weight_kg", "bike_weight_kg", "headwind_kmh",
+                    "wind_direction_deg", "temperature_c", "cda", "crr"]:
+            self.assertIn(key, PLANNER_PARAMS)
+            self.assertIn("label", PLANNER_PARAMS[key])
+
+    # ---- Monte Carlo ----
+    def test_monte_carlo_basic(self) -> None:
+        mc = monte_carlo_simulation(
+            self.rider, self.bike, self.segments,
+            [MCVariable("power_watts", "normal", mean=250, std=15)],
+            n=300, seed=1)
+        self.assertEqual(mc.n, 300)
+        self.assertEqual(len(mc.times_s), 300)
+        self.assertGreater(mc.mean_time_s, 0)
+        self.assertGreater(mc.std_time_s, 0)
+        self.assertAlmostEqual(mc.distance_m, 6000)
+
+    def test_monte_carlo_percentiles_ordered(self) -> None:
+        mc = monte_carlo_simulation(
+            self.rider, self.bike, self.segments,
+            [MCVariable("power_watts", "normal", mean=250, std=20),
+             MCVariable("headwind_kmh", "uniform", low=-5, high=15)],
+            n=500, seed=7)
+        p = mc.percentiles_s
+        self.assertLessEqual(p[5], p[50])
+        self.assertLessEqual(p[50], p[95])
+        self.assertLessEqual(mc.min_time_s, p[5])
+        self.assertGreaterEqual(mc.max_time_s, p[95])
+
+    def test_monte_carlo_reproducible(self) -> None:
+        args = (self.rider, self.bike, self.segments,
+                [MCVariable("power_watts", "normal", mean=250, std=15)])
+        a = monte_carlo_simulation(*args, n=200, seed=99)
+        b = monte_carlo_simulation(*args, n=200, seed=99)
+        self.assertAlmostEqual(a.mean_time_s, b.mean_time_s, places=6)
+
+    def test_monte_carlo_requires_segments(self) -> None:
+        with self.assertRaises(ValueError):
+            monte_carlo_simulation(self.rider, self.bike, [],
+                                   [MCVariable("power_watts", "normal", 250, 10)])
+
+    # ---- 1D sweep ----
+    def test_sweep_1d_power_monotonic(self) -> None:
+        sw = sweep_1d(self.rider, self.bike, self.segments,
+                      "power_watts", 150, 400, 12)
+        self.assertEqual(len(sw.values), 12)
+        self.assertEqual(len(sw.times_s), 12)
+        # More power => less time (strictly decreasing across the range)
+        self.assertGreater(sw.times_s[0], sw.times_s[-1])
+        for i in range(len(sw.times_s) - 1):
+            self.assertGreaterEqual(sw.times_s[i], sw.times_s[i + 1] - 1e-6)
+
+    def test_sweep_1d_weight_monotonic(self) -> None:
+        sw = sweep_1d(self.rider, self.bike, self.segments,
+                      "weight_kg", 60, 95, 8)
+        # More weight => more time on a net-climbing course
+        self.assertLess(sw.times_s[0], sw.times_s[-1])
+
+    def test_sweep_1d_bad_key(self) -> None:
+        with self.assertRaises(ValueError):
+            sweep_1d(self.rider, self.bike, self.segments, "nope", 0, 1, 5)
+
+    # ---- 2D sweep ----
+    def test_sweep_2d_grid_shape(self) -> None:
+        s2 = sweep_2d(self.rider, self.bike, self.segments,
+                      "power_watts", "weight_kg", (150, 400), (60, 90), 6, 5)
+        self.assertEqual(len(s2.y_values), 5)
+        self.assertEqual(len(s2.x_values), 6)
+        self.assertEqual(len(s2.times_s), 5)
+        self.assertEqual(len(s2.times_s[0]), 6)
+
+    def test_sweep_2d_optimum_corner(self) -> None:
+        # Min time should be at max power + min weight
+        s2 = sweep_2d(self.rider, self.bike, self.segments,
+                      "power_watts", "weight_kg", (150, 400), (60, 90), 8, 8)
+        self.assertAlmostEqual(s2.best_x, 400, delta=1)
+        self.assertAlmostEqual(s2.best_y, 60, delta=1)
+
+    def test_sweep_2d_same_var_raises(self) -> None:
+        with self.assertRaises(ValueError):
+            sweep_2d(self.rider, self.bike, self.segments,
+                     "power_watts", "power_watts", (1, 2), (1, 2))
+
+    # ---- optimization ----
+    def test_optimize_saves_time(self) -> None:
+        opt = optimize_setup(
+            self.rider, self.bike, self.segments,
+            [OptimizeVariable("power_watts", 200, 350),
+             OptimizeVariable("weight_kg", 65, 75),
+             OptimizeVariable("cda", 0.25, 0.40)],
+            ftp=260)
+        self.assertGreater(opt.time_saved_s, 0)
+        self.assertLess(opt.optimized_time_s, opt.baseline_time_s)
+        # Optimizer should pick max power, min weight, min cda
+        self.assertAlmostEqual(opt.optimized_values["power_watts"], 350, delta=2)
+        self.assertAlmostEqual(opt.optimized_values["weight_kg"], 65, delta=1)
+        self.assertAlmostEqual(opt.optimized_values["cda"], 0.25, delta=0.01)
+
+    def test_optimize_includes_pacing(self) -> None:
+        opt = optimize_setup(
+            self.rider, self.bike, self.segments,
+            [OptimizeVariable("power_watts", 200, 320)],
+            ftp=260, include_pacing=True)
+        self.assertIsNotNone(opt.pacing)
+        self.assertGreater(opt.pacing.total_time_s, 0)
+
+    def test_optimize_no_pacing(self) -> None:
+        opt = optimize_setup(
+            self.rider, self.bike, self.segments,
+            [OptimizeVariable("power_watts", 200, 320)],
+            include_pacing=False)
+        self.assertIsNone(opt.pacing)
+
+
+class TestSolveSpeedOverrides(unittest.TestCase):
+    def setUp(self) -> None:
+        self.rider = RiderParams(power_watts=250, weight_kg=75, height_cm=178)
+        self.bike = BikeParams()
+        self.course = CourseParams(grade_pct=0.0)
+
+    def test_cda_override_changes_speed(self) -> None:
+        base = solve_speed(self.rider, self.bike, self.course)
+        lower = solve_speed(self.rider, self.bike, self.course, cda_override=0.20)
+        higher = solve_speed(self.rider, self.bike, self.course, cda_override=0.50)
+        # Lower drag => faster, higher drag => slower
+        self.assertGreater(lower.speed_kmh, base.speed_kmh)
+        self.assertLess(higher.speed_kmh, base.speed_kmh)
+        self.assertAlmostEqual(lower.cda, 0.20, places=6)
+
+    def test_crr_override_changes_speed(self) -> None:
+        base = solve_speed(self.rider, self.bike, self.course)
+        lower = solve_speed(self.rider, self.bike, self.course, crr_override=0.002)
+        self.assertGreater(lower.speed_kmh, base.speed_kmh)
+        self.assertAlmostEqual(lower.crr, 0.002, places=6)
+
+    def test_none_overrides_match_default(self) -> None:
+        a = solve_speed(self.rider, self.bike, self.course)
+        b = solve_speed(self.rider, self.bike, self.course,
+                        cda_override=None, crr_override=None)
+        self.assertAlmostEqual(a.speed_kmh, b.speed_kmh, places=9)
 
 
 if __name__ == "__main__":

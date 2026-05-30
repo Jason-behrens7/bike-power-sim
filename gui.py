@@ -47,6 +47,15 @@ from simulation import (
     power_to_weight_ratio,
     power_zones,
     predict_kom,
+    # Race Planner backend
+    MCVariable,
+    OptimizeVariable,
+    PLANNER_PARAMS,
+    monte_carlo_simulation,
+    optimize_setup,
+    planner_base_value,
+    sweep_1d,
+    sweep_2d,
     save_presets,
     simulate_course_profile,
     solve_speed,
@@ -155,6 +164,57 @@ def _convert_elev(elev_m: float, imperial: bool) -> float:
     return elev_m * 3.28084 if imperial else elev_m
 
 
+# --- Race Planner variable unit handling -----------------------------------
+# Backend stores everything in metric; the GUI shows/accepts values in the
+# active unit system and converts at the boundary.
+_PLANNER_LB_PER_KG = 2.2046226218
+_PLANNER_MI_PER_KM = 0.621371
+
+
+def _planner_unit(key: str, imperial: bool) -> str:
+    if key in ("weight_kg", "bike_weight_kg"):
+        return "lb" if imperial else "kg"
+    if key == "headwind_kmh":
+        return "mph" if imperial else "km/h"
+    if key == "temperature_c":
+        return "\u00b0F" if imperial else "\u00b0C"
+    if key == "power_watts":
+        return "W"
+    if key == "wind_direction_deg":
+        return "\u00b0"
+    if key == "cda":
+        return "m\u00b2"
+    return ""  # crr is dimensionless
+
+
+def _planner_to_display(key: str, v_metric: float, imperial: bool,
+                        is_delta: bool = False) -> float:
+    """Convert a metric planner value to the active display unit."""
+    if not imperial:
+        return v_metric
+    if key in ("weight_kg", "bike_weight_kg"):
+        return v_metric * _PLANNER_LB_PER_KG
+    if key == "headwind_kmh":
+        return v_metric * _PLANNER_MI_PER_KM
+    if key == "temperature_c":
+        return v_metric * 9.0 / 5.0 + (0.0 if is_delta else 32.0)
+    return v_metric
+
+
+def _planner_to_metric(key: str, v_disp: float, imperial: bool,
+                       is_delta: bool = False) -> float:
+    """Convert a display-unit planner value back to metric."""
+    if not imperial:
+        return v_disp
+    if key in ("weight_kg", "bike_weight_kg"):
+        return v_disp / _PLANNER_LB_PER_KG
+    if key == "headwind_kmh":
+        return v_disp / _PLANNER_MI_PER_KM
+    if key == "temperature_c":
+        return (v_disp - (0.0 if is_delta else 32.0)) * 5.0 / 9.0
+    return v_disp
+
+
 # ---------------------------------------------------------------------------
 # Main application
 # ---------------------------------------------------------------------------
@@ -175,6 +235,13 @@ class BikeSimApp(tk.Tk):
         self._animation_id: str | None = None
         self._last_course_result: Any = None
         self._last_result: SimulationResult | None = None
+
+        # Race Planner state
+        self._planner_unit_entries: list[dict[str, Any]] = []
+        self._last_mc_result: Any = None
+        self._last_sweep1d_result: Any = None
+        self._last_sweep2d_result: Any = None
+        self._last_optimize_result: Any = None
 
         # Real-time simulation state
         self._rt_running = False
@@ -379,6 +446,7 @@ class BikeSimApp(tk.Tk):
         self._build_ride_analysis_tab()
         self._build_whatif_tab()
         self._build_kom_tab()
+        self._build_planner_tab()
         self._build_export_tab()
 
         # Status bar
@@ -2327,7 +2395,716 @@ class BikeSimApp(tk.Tk):
         self.canvas_kom.draw_idle()
 
     # ==================================================================
-    # TAB 14: Export
+    # TAB 14: Race Planner (Monte Carlo / sweeps / optimization)
+    # ==================================================================
+    _MC_STD_DEFAULTS = {
+        "power_watts": 15.0, "weight_kg": 1.5, "bike_weight_kg": 0.3,
+        "headwind_kmh": 8.0, "wind_direction_deg": 20.0,
+        "temperature_c": 3.0, "cda": 0.010, "crr": 0.0005,
+    }
+    _OPT_BOUND_DEFAULTS = {
+        "power_watts": (200.0, 350.0), "weight_kg": (60.0, 80.0),
+        "bike_weight_kg": (6.0, 9.0), "headwind_kmh": (-10.0, 10.0),
+        "wind_direction_deg": (0.0, 360.0), "temperature_c": (5.0, 35.0),
+        "cda": (0.20, 0.40), "crr": (0.002, 0.008),
+    }
+
+    def _build_planner_tab(self) -> None:
+        tab = ttk.Frame(self._notebook)
+        self._notebook.add(tab, text="  \U0001f3c1 Race Planner  ")
+
+        self._label_to_key = {
+            info["label"]: key for key, info in PLANNER_PARAMS.items()
+        }
+
+        sub = ttk.Notebook(tab)
+        sub.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self._planner_subnb = sub
+
+        self._build_mc_subtab(sub)
+        self._build_sweep1d_subtab(sub)
+        self._build_sweep2d_subtab(sub)
+        self._build_optimize_subtab(sub)
+
+    # ---- helpers ------------------------------------------------------
+    def _planner_unit_entry(self, parent: tk.Widget, key: str,
+                            init_metric: float, is_delta: bool = False,
+                            width: int = 7) -> tuple[tk.DoubleVar, ttk.Entry, ttk.Label]:
+        """A numeric entry shown in the active unit; tracked for toggling."""
+        disp = _planner_to_display(key, init_metric, self._imperial, is_delta)
+        var = tk.DoubleVar(value=round(disp, 5))
+        entry = ttk.Entry(parent, textvariable=var, width=width)
+        unit_lbl = _label(parent, _planner_unit(key, self._imperial),
+                          style="Card.TLabel")
+        self._planner_unit_entries.append(
+            {"key": key, "var": var, "is_delta": is_delta,
+             "unit_label": unit_lbl}
+        )
+        return var, entry, unit_lbl
+
+    def _read_planner_metric(self, var: tk.DoubleVar, key: str,
+                             is_delta: bool = False) -> float:
+        return _planner_to_metric(key, var.get(), self._imperial, is_delta)
+
+    def _planner_default_range(self, key: str) -> tuple[float, float]:
+        base = None
+        try:
+            segs = self._get_whatif_segments()
+            rider, bike, _ = self._gather_params()
+            if segs:
+                base = planner_base_value(rider, bike, segs, key)
+        except Exception:
+            base = None
+        if base is not None:
+            if key == "power_watts":
+                return (max(50.0, base - 80), base + 80)
+            if key == "weight_kg":
+                return (max(40.0, base - 12), base + 12)
+            if key == "bike_weight_kg":
+                return (max(4.0, base - 3), base + 3)
+            if key == "cda":
+                return (max(0.10, base * 0.75), base * 1.25)
+        return self._OPT_BOUND_DEFAULTS.get(key, (0.0, 1.0))
+
+    # ---- Monte Carlo --------------------------------------------------
+    def _build_mc_subtab(self, nb: ttk.Notebook) -> None:
+        tab = ttk.Frame(nb)
+        nb.add(tab, text="  Monte Carlo  ")
+        paned = ttk.PanedWindow(tab, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+        left = ttk.Frame(paned)
+        paned.add(left, weight=1)
+        right = ttk.Frame(paned)
+        paned.add(right, weight=3)
+
+        info = self._make_card(left, "Monte Carlo Finish Time")
+        ttk.Label(info,
+                  text="Models race-day uncertainty. Each enabled input is\n"
+                       "sampled from a Normal(current value, \u00b1\u03c3) per run.\n"
+                       "Uses Course Profile segments.",
+                  font=("Helvetica", 9), wraplength=300,
+                  justify=tk.LEFT).pack(padx=8, pady=4, anchor=tk.W)
+
+        card = self._make_card(left, "Uncertain Inputs (\u00b11\u03c3)")
+        grid = ttk.Frame(card, style="Card.TFrame")
+        grid.pack(fill=tk.X, padx=8, pady=4)
+        self._mc_enable: dict[str, tk.BooleanVar] = {}
+        self._mc_std: dict[str, tk.DoubleVar] = {}
+        default_on = {"power_watts", "headwind_kmh"}
+        for r, key in enumerate(PLANNER_PARAMS):
+            en = tk.BooleanVar(value=key in default_on)
+            self._mc_enable[key] = en
+            ttk.Checkbutton(grid, text=PLANNER_PARAMS[key]["label"],
+                            variable=en, style="TCheckbutton").grid(
+                row=r, column=0, sticky=tk.W, pady=1)
+            ttk.Label(grid, text="\u00b1", style="Card.TLabel").grid(
+                row=r, column=1, padx=(8, 2))
+            var, entry, ulbl = self._planner_unit_entry(
+                grid, key, self._MC_STD_DEFAULTS[key], is_delta=True)
+            self._mc_std[key] = var
+            entry.grid(row=r, column=2)
+            ulbl.grid(row=r, column=3, sticky=tk.W, padx=(2, 0))
+
+        run_card = self._make_card(left, "Run")
+        rrow = ttk.Frame(run_card, style="Card.TFrame")
+        rrow.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Label(rrow, text="Iterations:", style="Card.TLabel").pack(side=tk.LEFT)
+        self.var_mc_iters = tk.IntVar(value=1000)
+        ttk.Entry(rrow, textvariable=self.var_mc_iters, width=8).pack(
+            side=tk.LEFT, padx=6)
+        ttk.Button(left, text="Run Monte Carlo",
+                   command=self._run_monte_carlo).pack(fill=tk.X, padx=8, pady=8)
+
+        self.lbl_mc_results = ttk.Label(
+            right, text="Enable inputs and click 'Run Monte Carlo'.",
+            font=("Helvetica", 10), justify=tk.LEFT, wraplength=620)
+        self.lbl_mc_results.pack(padx=12, pady=8, anchor=tk.NW)
+
+        t = self._theme
+        self.fig_mc = Figure(figsize=(8, 4.6), dpi=100, facecolor=t["BG"])
+        self.fig_mc.subplots_adjust(left=0.1, right=0.96, top=0.9, bottom=0.14)
+        self.ax_mc = self.fig_mc.add_subplot(111)
+        self.canvas_mc = FigureCanvasTkAgg(self.fig_mc, master=right)
+        self.canvas_mc.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8)
+
+    def _run_monte_carlo(self) -> None:
+        segments = self._get_whatif_segments()
+        if not segments:
+            messagebox.showwarning("No Course",
+                                   "Add segments in the Course Profile tab first.")
+            return
+        variables: list[MCVariable] = []
+        rider, bike, _ = self._gather_params()
+        for key in PLANNER_PARAMS:
+            if not self._mc_enable[key].get():
+                continue
+            std = abs(self._read_planner_metric(self._mc_std[key], key, True))
+            if std <= 0:
+                continue
+            mean = planner_base_value(rider, bike, segments, key)
+            variables.append(MCVariable(key=key, distribution="normal",
+                                        mean=mean, std=std))
+        if not variables:
+            messagebox.showinfo(
+                "No Inputs", "Enable at least one input with a non-zero \u00b1.")
+            return
+        n = max(10, min(20000, int(self.var_mc_iters.get())))
+        try:
+            result = monte_carlo_simulation(rider, bike, segments, variables, n=n)
+        except Exception as exc:
+            messagebox.showerror("Monte Carlo failed", str(exc))
+            return
+        self._last_mc_result = result
+        self._display_mc_results(result)
+
+    def _display_mc_results(self, result: Any) -> None:
+        imp = self._imperial
+        su = _speed_unit(imp)
+        dist_km = result.distance_m / 1000.0
+        dist = _convert_dist_km(dist_km, imp)
+        p = result.percentiles_s
+        mean_spd = _convert_speed(
+            result.distance_m / 1000.0 / (result.mean_time_s / 3600.0)
+            if result.mean_time_s > 0 else 0.0, imp)
+        varied = ", ".join(PLANNER_PARAMS[k]["label"] for k in result.variable_keys)
+        text = (
+            f"Monte Carlo \u2014 {result.n} runs over {dist:.2f} {_dist_unit(imp)}\n"
+            f"Varied: {varied}\n\n"
+            f"Mean finish: {_format_time(result.mean_time_s)}  "
+            f"(\u00b1{result.std_time_s:.0f}s, avg {mean_spd:.1f} {su})\n"
+            f"P5  (best 5%):   {_format_time(p[5])}\n"
+            f"P50 (median):    {_format_time(p[50])}\n"
+            f"P90:             {_format_time(p[90])}\n"
+            f"P95 (worst 5%):  {_format_time(p[95])}\n"
+            f"Range: {_format_time(result.min_time_s)} "
+            f"\u2192 {_format_time(result.max_time_s)}"
+        )
+        self.lbl_mc_results.configure(text=text)
+
+        t = self._theme
+        ax = self.ax_mc
+        ax.clear()
+        _style_ax(ax, t)
+        times_min = [x / 60.0 for x in result.times_s]
+        ax.hist(times_min, bins=40, color=t["ACCENT"], alpha=0.8,
+                edgecolor=t["BORDER"])
+        for pct, col, lbl in [(50, t["ACCENT2"], "P50"),
+                              (90, t["ACCENT3"], "P90"),
+                              (95, t["DANGER"], "P95")]:
+            ax.axvline(p[pct] / 60.0, color=col, linewidth=1.6,
+                       linestyle="--", label=f"{lbl} {_format_time(p[pct])}")
+        ax.set_xlabel("Finish time (minutes)", color=t["FG"], fontsize=9)
+        ax.set_ylabel("Frequency", color=t["FG"], fontsize=9)
+        ax.set_title("Finish-Time Distribution", color=t["FG"],
+                     fontsize=11, fontweight="bold")
+        ax.legend(facecolor=t["BG_LIGHT"], edgecolor=t["BORDER"],
+                  labelcolor=t["FG"], fontsize=8)
+        self.canvas_mc.draw_idle()
+
+    # ---- 1D sweep -----------------------------------------------------
+    def _build_sweep1d_subtab(self, nb: ttk.Notebook) -> None:
+        tab = ttk.Frame(nb)
+        nb.add(tab, text="  1D Sweep  ")
+        paned = ttk.PanedWindow(tab, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+        left = ttk.Frame(paned)
+        paned.add(left, weight=1)
+        right = ttk.Frame(paned)
+        paned.add(right, weight=3)
+
+        info = self._make_card(left, "Parameter Sweep")
+        ttk.Label(info,
+                  text="Sweep one input across a range and see how your\n"
+                       "finish time and average speed respond.",
+                  font=("Helvetica", 9), wraplength=300,
+                  justify=tk.LEFT).pack(padx=8, pady=4, anchor=tk.W)
+
+        card = self._make_card(left, "Variable")
+        self.var_sweep1d_label = tk.StringVar(value=PLANNER_PARAMS["power_watts"]["label"])
+        labels = [PLANNER_PARAMS[k]["label"] for k in PLANNER_PARAMS]
+        ttk.OptionMenu(card, self.var_sweep1d_label, self.var_sweep1d_label.get(),
+                       *labels, command=self._sweep1d_on_var_change).pack(
+            fill=tk.X, padx=8, pady=4)
+
+        rng = ttk.Frame(card, style="Card.TFrame")
+        rng.pack(fill=tk.X, padx=8, pady=4)
+        self._sweep1d_key = "power_watts"
+        lo, hi = self._planner_default_range("power_watts")
+        ttk.Label(rng, text="Min", style="Card.TLabel").grid(row=0, column=0)
+        self.var_sweep1d_min = tk.DoubleVar(
+            value=round(_planner_to_display("power_watts", lo, self._imperial), 4))
+        ttk.Entry(rng, textvariable=self.var_sweep1d_min, width=8).grid(
+            row=0, column=1, padx=4)
+        ttk.Label(rng, text="Max", style="Card.TLabel").grid(row=0, column=2)
+        self.var_sweep1d_max = tk.DoubleVar(
+            value=round(_planner_to_display("power_watts", hi, self._imperial), 4))
+        ttk.Entry(rng, textvariable=self.var_sweep1d_max, width=8).grid(
+            row=0, column=3, padx=4)
+        self.lbl_sweep1d_unit = _label(rng, _planner_unit("power_watts", self._imperial),
+                                       style="Card.TLabel")
+        self.lbl_sweep1d_unit.grid(row=0, column=4, padx=(4, 0))
+
+        prow = ttk.Frame(card, style="Card.TFrame")
+        prow.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Label(prow, text="Points:", style="Card.TLabel").pack(side=tk.LEFT)
+        self.var_sweep1d_points = tk.IntVar(value=25)
+        ttk.Entry(prow, textvariable=self.var_sweep1d_points, width=6).pack(
+            side=tk.LEFT, padx=6)
+
+        ttk.Button(left, text="Run Sweep",
+                   command=self._run_sweep1d).pack(fill=tk.X, padx=8, pady=8)
+
+        self.lbl_sweep1d_results = ttk.Label(
+            right, text="Pick a variable and click 'Run Sweep'.",
+            font=("Helvetica", 10), justify=tk.LEFT, wraplength=620)
+        self.lbl_sweep1d_results.pack(padx=12, pady=8, anchor=tk.NW)
+
+        t = self._theme
+        self.fig_sweep1d = Figure(figsize=(8, 4.6), dpi=100, facecolor=t["BG"])
+        self.fig_sweep1d.subplots_adjust(left=0.12, right=0.88, top=0.9, bottom=0.14)
+        self.ax_sweep1d = self.fig_sweep1d.add_subplot(111)
+        self.canvas_sweep1d = FigureCanvasTkAgg(self.fig_sweep1d, master=right)
+        self.canvas_sweep1d.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8)
+
+    def _sweep1d_on_var_change(self, _label: str | None = None) -> None:
+        key = self._label_to_key[self.var_sweep1d_label.get()]
+        self._sweep1d_key = key
+        lo, hi = self._planner_default_range(key)
+        self.var_sweep1d_min.set(round(_planner_to_display(key, lo, self._imperial), 4))
+        self.var_sweep1d_max.set(round(_planner_to_display(key, hi, self._imperial), 4))
+        self.lbl_sweep1d_unit.configure(text=_planner_unit(key, self._imperial))
+
+    def _run_sweep1d(self) -> None:
+        segments = self._get_whatif_segments()
+        if not segments:
+            messagebox.showwarning("No Course",
+                                   "Add segments in the Course Profile tab first.")
+            return
+        key = self._sweep1d_key
+        lo = _planner_to_metric(key, self.var_sweep1d_min.get(), self._imperial)
+        hi = _planner_to_metric(key, self.var_sweep1d_max.get(), self._imperial)
+        npts = max(2, min(200, int(self.var_sweep1d_points.get())))
+        rider, bike, _ = self._gather_params()
+        try:
+            result = sweep_1d(rider, bike, segments, key, lo, hi, npts)
+        except Exception as exc:
+            messagebox.showerror("Sweep failed", str(exc))
+            return
+        self._last_sweep1d_result = result
+        self._display_sweep1d_results(result)
+
+    def _display_sweep1d_results(self, result: Any) -> None:
+        imp = self._imperial
+        key = result.key
+        unit = _planner_unit(key, imp)
+        x = [_planner_to_display(key, v, imp) for v in result.values]
+        times_min = [tt / 60.0 for tt in result.times_s]
+        speeds = [_convert_speed(s, imp) for s in result.avg_speeds_kmh]
+        su = _speed_unit(imp)
+
+        best_i = int(min(range(len(result.times_s)),
+                         key=lambda i: result.times_s[i]))
+        worst_i = int(max(range(len(result.times_s)),
+                          key=lambda i: result.times_s[i]))
+        spread = result.times_s[worst_i] - result.times_s[best_i]
+        text = (
+            f"Sweep: {PLANNER_PARAMS[key]['label']}\n\n"
+            f"Range: {x[0]:.3g} \u2192 {x[-1]:.3g} {unit}\n"
+            f"Fastest: {_format_time(result.times_s[best_i])} "
+            f"at {x[best_i]:.3g} {unit}\n"
+            f"Slowest: {_format_time(result.times_s[worst_i])} "
+            f"at {x[worst_i]:.3g} {unit}\n"
+            f"Total spread: {spread:.0f}s across the range"
+        )
+        self.lbl_sweep1d_results.configure(text=text)
+
+        t = self._theme
+        ax = self.ax_sweep1d
+        ax.clear()
+        _style_ax(ax, t)
+        ax.plot(x, times_min, color=t["ACCENT"], linewidth=2, marker="o",
+                markersize=3, label="Finish time")
+        ax.set_xlabel(f"{PLANNER_PARAMS[key]['label']} ({unit})",
+                      color=t["FG"], fontsize=9)
+        ax.set_ylabel("Finish time (min)", color=t["ACCENT"], fontsize=9)
+        ax.set_title(f"Finish Time vs {PLANNER_PARAMS[key]['label']}",
+                     color=t["FG"], fontsize=11, fontweight="bold")
+
+        # current value marker
+        base_disp = _planner_to_display(key, result.base_value, imp)
+        if x[0] <= base_disp <= x[-1] or x[-1] <= base_disp <= x[0]:
+            ax.axvline(base_disp, color=t["FG_DIM"], linestyle=":",
+                       linewidth=1.2, label="Current")
+
+        ax2 = ax.twinx()
+        ax2.plot(x, speeds, color=t["ACCENT2"], linewidth=1.6,
+                 linestyle="--", label=f"Avg speed ({su})")
+        ax2.set_ylabel(f"Avg speed ({su})", color=t["ACCENT2"], fontsize=9)
+        ax2.tick_params(colors=t["FG"], labelsize=8)
+        for spine in ax2.spines.values():
+            spine.set_color(t["BORDER"])
+
+        lines1, labels1 = ax.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax.legend(lines1 + lines2, labels1 + labels2,
+                  facecolor=t["BG_LIGHT"], edgecolor=t["BORDER"],
+                  labelcolor=t["FG"], fontsize=8, loc="best")
+        self.fig_sweep1d.tight_layout()
+        self.canvas_sweep1d.draw_idle()
+
+    # ---- 2D contour ---------------------------------------------------
+    def _build_sweep2d_subtab(self, nb: ttk.Notebook) -> None:
+        tab = ttk.Frame(nb)
+        nb.add(tab, text="  2D Contour  ")
+        paned = ttk.PanedWindow(tab, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+        left = ttk.Frame(paned)
+        paned.add(left, weight=1)
+        right = ttk.Frame(paned)
+        paned.add(right, weight=3)
+
+        info = self._make_card(left, "2D Sweep / Contour")
+        ttk.Label(info,
+                  text="Sweep two inputs together to map finish time as a\n"
+                       "contour. The optimum cell and your current setup\n"
+                       "are marked.",
+                  font=("Helvetica", 9), wraplength=300,
+                  justify=tk.LEFT).pack(padx=8, pady=4, anchor=tk.W)
+
+        labels = [PLANNER_PARAMS[k]["label"] for k in PLANNER_PARAMS]
+
+        # X axis
+        xcard = self._make_card(left, "X Axis")
+        self.var_sweep2d_xlabel = tk.StringVar(value=PLANNER_PARAMS["power_watts"]["label"])
+        self._sweep2d_xkey = "power_watts"
+        ttk.OptionMenu(xcard, self.var_sweep2d_xlabel, self.var_sweep2d_xlabel.get(),
+                       *labels, command=lambda v: self._sweep2d_on_var_change("x")).pack(
+            fill=tk.X, padx=8, pady=2)
+        xr = ttk.Frame(xcard, style="Card.TFrame")
+        xr.pack(fill=tk.X, padx=8, pady=2)
+        lo, hi = self._planner_default_range("power_watts")
+        ttk.Label(xr, text="Min", style="Card.TLabel").grid(row=0, column=0)
+        self.var_sweep2d_xmin = tk.DoubleVar(value=round(_planner_to_display("power_watts", lo, self._imperial), 4))
+        ttk.Entry(xr, textvariable=self.var_sweep2d_xmin, width=7).grid(row=0, column=1, padx=3)
+        ttk.Label(xr, text="Max", style="Card.TLabel").grid(row=0, column=2)
+        self.var_sweep2d_xmax = tk.DoubleVar(value=round(_planner_to_display("power_watts", hi, self._imperial), 4))
+        ttk.Entry(xr, textvariable=self.var_sweep2d_xmax, width=7).grid(row=0, column=3, padx=3)
+        self.lbl_sweep2d_xunit = _label(xr, _planner_unit("power_watts", self._imperial), style="Card.TLabel")
+        self.lbl_sweep2d_xunit.grid(row=0, column=4, padx=(3, 0))
+
+        # Y axis
+        ycard = self._make_card(left, "Y Axis")
+        self.var_sweep2d_ylabel = tk.StringVar(value=PLANNER_PARAMS["weight_kg"]["label"])
+        self._sweep2d_ykey = "weight_kg"
+        ttk.OptionMenu(ycard, self.var_sweep2d_ylabel, self.var_sweep2d_ylabel.get(),
+                       *labels, command=lambda v: self._sweep2d_on_var_change("y")).pack(
+            fill=tk.X, padx=8, pady=2)
+        yr = ttk.Frame(ycard, style="Card.TFrame")
+        yr.pack(fill=tk.X, padx=8, pady=2)
+        lo, hi = self._planner_default_range("weight_kg")
+        ttk.Label(yr, text="Min", style="Card.TLabel").grid(row=0, column=0)
+        self.var_sweep2d_ymin = tk.DoubleVar(value=round(_planner_to_display("weight_kg", lo, self._imperial), 4))
+        ttk.Entry(yr, textvariable=self.var_sweep2d_ymin, width=7).grid(row=0, column=1, padx=3)
+        ttk.Label(yr, text="Max", style="Card.TLabel").grid(row=0, column=2)
+        self.var_sweep2d_ymax = tk.DoubleVar(value=round(_planner_to_display("weight_kg", hi, self._imperial), 4))
+        ttk.Entry(yr, textvariable=self.var_sweep2d_ymax, width=7).grid(row=0, column=3, padx=3)
+        self.lbl_sweep2d_yunit = _label(yr, _planner_unit("weight_kg", self._imperial), style="Card.TLabel")
+        self.lbl_sweep2d_yunit.grid(row=0, column=4, padx=(3, 0))
+
+        gcard = self._make_card(left, "Grid")
+        grow = ttk.Frame(gcard, style="Card.TFrame")
+        grow.pack(fill=tk.X, padx=8, pady=2)
+        ttk.Label(grow, text="Resolution:", style="Card.TLabel").pack(side=tk.LEFT)
+        self.var_sweep2d_res = tk.IntVar(value=22)
+        ttk.Entry(grow, textvariable=self.var_sweep2d_res, width=6).pack(side=tk.LEFT, padx=6)
+        ttk.Label(grow, text="(per axis)", style="Small.TLabel").pack(side=tk.LEFT)
+
+        ttk.Button(left, text="Run Contour",
+                   command=self._run_sweep2d).pack(fill=tk.X, padx=8, pady=8)
+
+        self.lbl_sweep2d_results = ttk.Label(
+            right, text="Choose X and Y inputs and click 'Run Contour'.",
+            font=("Helvetica", 10), justify=tk.LEFT, wraplength=620)
+        self.lbl_sweep2d_results.pack(padx=12, pady=8, anchor=tk.NW)
+
+        t = self._theme
+        self.fig_sweep2d = Figure(figsize=(8, 4.8), dpi=100, facecolor=t["BG"])
+        self.fig_sweep2d.subplots_adjust(left=0.12, right=0.98, top=0.9, bottom=0.14)
+        self.ax_sweep2d = self.fig_sweep2d.add_subplot(111)
+        self.canvas_sweep2d = FigureCanvasTkAgg(self.fig_sweep2d, master=right)
+        self.canvas_sweep2d.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8)
+        self._sweep2d_colorbar = None
+
+    def _sweep2d_on_var_change(self, axis: str) -> None:
+        if axis == "x":
+            key = self._label_to_key[self.var_sweep2d_xlabel.get()]
+            self._sweep2d_xkey = key
+            lo, hi = self._planner_default_range(key)
+            self.var_sweep2d_xmin.set(round(_planner_to_display(key, lo, self._imperial), 4))
+            self.var_sweep2d_xmax.set(round(_planner_to_display(key, hi, self._imperial), 4))
+            self.lbl_sweep2d_xunit.configure(text=_planner_unit(key, self._imperial))
+        else:
+            key = self._label_to_key[self.var_sweep2d_ylabel.get()]
+            self._sweep2d_ykey = key
+            lo, hi = self._planner_default_range(key)
+            self.var_sweep2d_ymin.set(round(_planner_to_display(key, lo, self._imperial), 4))
+            self.var_sweep2d_ymax.set(round(_planner_to_display(key, hi, self._imperial), 4))
+            self.lbl_sweep2d_yunit.configure(text=_planner_unit(key, self._imperial))
+
+    def _run_sweep2d(self) -> None:
+        segments = self._get_whatif_segments()
+        if not segments:
+            messagebox.showwarning("No Course",
+                                   "Add segments in the Course Profile tab first.")
+            return
+        kx, ky = self._sweep2d_xkey, self._sweep2d_ykey
+        if kx == ky:
+            messagebox.showinfo("Pick two", "Choose two different variables.")
+            return
+        xr = (_planner_to_metric(kx, self.var_sweep2d_xmin.get(), self._imperial),
+              _planner_to_metric(kx, self.var_sweep2d_xmax.get(), self._imperial))
+        yr = (_planner_to_metric(ky, self.var_sweep2d_ymin.get(), self._imperial),
+              _planner_to_metric(ky, self.var_sweep2d_ymax.get(), self._imperial))
+        res = max(5, min(60, int(self.var_sweep2d_res.get())))
+        rider, bike, _ = self._gather_params()
+        try:
+            result = sweep_2d(rider, bike, segments, kx, ky, xr, yr, res, res)
+        except Exception as exc:
+            messagebox.showerror("Contour failed", str(exc))
+            return
+        self._last_sweep2d_result = result
+        self._display_sweep2d_results(result)
+
+    def _display_sweep2d_results(self, result: Any) -> None:
+        imp = self._imperial
+        kx, ky = result.key_x, result.key_y
+        ux, uy = _planner_unit(kx, imp), _planner_unit(ky, imp)
+        x = [_planner_to_display(kx, v, imp) for v in result.x_values]
+        y = [_planner_to_display(ky, v, imp) for v in result.y_values]
+        z_min = [[tt / 60.0 for tt in row] for row in result.times_s]
+        best_x = _planner_to_display(kx, result.best_x, imp)
+        best_y = _planner_to_display(ky, result.best_y, imp)
+        base_x = _planner_to_display(kx, result.base_x, imp)
+        base_y = _planner_to_display(ky, result.base_y, imp)
+
+        text = (
+            f"X: {PLANNER_PARAMS[kx]['label']}   Y: {PLANNER_PARAMS[ky]['label']}\n\n"
+            f"Best finish: {_format_time(result.best_time_s)}\n"
+            f"  at {PLANNER_PARAMS[kx]['label']} = {best_x:.3g} {ux}\n"
+            f"  and {PLANNER_PARAMS[ky]['label']} = {best_y:.3g} {uy}"
+        )
+        self.lbl_sweep2d_results.configure(text=text)
+
+        import numpy as _np
+        t = self._theme
+        if self._sweep2d_colorbar is not None:
+            try:
+                self._sweep2d_colorbar.remove()
+            except Exception:
+                pass
+            self._sweep2d_colorbar = None
+        self.fig_sweep2d.clf()
+        ax = self.fig_sweep2d.add_subplot(111)
+        self.ax_sweep2d = ax
+        _style_ax(ax, t)
+        X, Y = _np.meshgrid(_np.array(x), _np.array(y))
+        Z = _np.array(z_min)
+        cf = ax.contourf(X, Y, Z, levels=18, cmap="viridis")
+        ax.contour(X, Y, Z, levels=10, colors=t["BG"], linewidths=0.4, alpha=0.4)
+        cb = self.fig_sweep2d.colorbar(cf, ax=ax)
+        cb.set_label("Finish time (min)", color=t["FG"], fontsize=9)
+        cb.ax.tick_params(colors=t["FG"], labelsize=8)
+        self._sweep2d_colorbar = cb
+
+        ax.scatter([best_x], [best_y], marker="*", s=240, color=t["ACCENT2"],
+                   edgecolor="black", zorder=5, label="Optimum")
+        if (min(x) <= base_x <= max(x)) and (min(y) <= base_y <= max(y)):
+            ax.scatter([base_x], [base_y], marker="o", s=70, color=t["DANGER"],
+                       edgecolor="white", zorder=5, label="Current")
+        ax.set_xlabel(f"{PLANNER_PARAMS[kx]['label']} ({ux})",
+                      color=t["FG"], fontsize=9)
+        ax.set_ylabel(f"{PLANNER_PARAMS[ky]['label']} ({uy})",
+                      color=t["FG"], fontsize=9)
+        ax.set_title("Finish-Time Contour", color=t["FG"],
+                     fontsize=11, fontweight="bold")
+        ax.legend(facecolor=t["BG_LIGHT"], edgecolor=t["BORDER"],
+                  labelcolor=t["FG"], fontsize=8, loc="best")
+        self.canvas_sweep2d.draw_idle()
+
+    # ---- Optimize -----------------------------------------------------
+    def _build_optimize_subtab(self, nb: ttk.Notebook) -> None:
+        tab = ttk.Frame(nb)
+        nb.add(tab, text="  Optimize  ")
+        paned = ttk.PanedWindow(tab, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
+        left = ttk.Frame(paned)
+        paned.add(left, weight=1)
+        right = ttk.Frame(paned)
+        paned.add(right, weight=3)
+
+        info = self._make_card(left, "Optimize Setup")
+        ttk.Label(info,
+                  text="Finds the fastest setup within your bounds, then\n"
+                       "recommends a pacing plan for the result.",
+                  font=("Helvetica", 9), wraplength=300,
+                  justify=tk.LEFT).pack(padx=8, pady=4, anchor=tk.W)
+
+        card = self._make_card(left, "Variables & Bounds")
+        grid = ttk.Frame(card, style="Card.TFrame")
+        grid.pack(fill=tk.X, padx=8, pady=4)
+        ttk.Label(grid, text="", style="Card.TLabel").grid(row=0, column=0)
+        ttk.Label(grid, text="Min", style="Card.TLabel").grid(row=0, column=2)
+        ttk.Label(grid, text="Max", style="Card.TLabel").grid(row=0, column=3)
+        self._opt_enable: dict[str, tk.BooleanVar] = {}
+        self._opt_low: dict[str, tk.DoubleVar] = {}
+        self._opt_high: dict[str, tk.DoubleVar] = {}
+        default_on = {"power_watts", "weight_kg", "cda"}
+        for r, key in enumerate(PLANNER_PARAMS, start=1):
+            en = tk.BooleanVar(value=key in default_on)
+            self._opt_enable[key] = en
+            ttk.Checkbutton(grid, text=PLANNER_PARAMS[key]["label"],
+                            variable=en, style="TCheckbutton").grid(
+                row=r, column=0, sticky=tk.W, pady=1)
+            lo, hi = self._OPT_BOUND_DEFAULTS[key]
+            lvar, lentry, _lu = self._planner_unit_entry(grid, key, lo)
+            hvar, hentry, hu = self._planner_unit_entry(grid, key, hi)
+            self._opt_low[key] = lvar
+            self._opt_high[key] = hvar
+            lentry.grid(row=r, column=2, padx=2)
+            hentry.grid(row=r, column=3, padx=2)
+            hu.grid(row=r, column=4, sticky=tk.W, padx=(2, 0))
+
+        ttk.Button(left, text="Optimize",
+                   command=self._run_optimize).pack(fill=tk.X, padx=8, pady=8)
+
+        self.lbl_optimize_results = ttk.Label(
+            right, text="Select variables, set bounds, and click 'Optimize'.",
+            font=("Helvetica", 10), justify=tk.LEFT, wraplength=640)
+        self.lbl_optimize_results.pack(padx=12, pady=8, anchor=tk.NW)
+
+        t = self._theme
+        self.fig_optimize = Figure(figsize=(8, 4.0), dpi=100, facecolor=t["BG"])
+        self.fig_optimize.subplots_adjust(left=0.12, right=0.96, top=0.88, bottom=0.18)
+        self.ax_optimize = self.fig_optimize.add_subplot(111)
+        self.canvas_optimize = FigureCanvasTkAgg(self.fig_optimize, master=right)
+        self.canvas_optimize.get_tk_widget().pack(fill=tk.BOTH, expand=True, padx=8)
+
+    def _run_optimize(self) -> None:
+        segments = self._get_whatif_segments()
+        if not segments:
+            messagebox.showwarning("No Course",
+                                   "Add segments in the Course Profile tab first.")
+            return
+        variables: list[OptimizeVariable] = []
+        for key in PLANNER_PARAMS:
+            if not self._opt_enable[key].get():
+                continue
+            lo = _planner_to_metric(key, self._opt_low[key].get(), self._imperial)
+            hi = _planner_to_metric(key, self._opt_high[key].get(), self._imperial)
+            variables.append(OptimizeVariable(key=key, low=lo, high=hi))
+        if not variables:
+            messagebox.showinfo("No Variables", "Enable at least one variable.")
+            return
+        rider, bike, _ = self._gather_params()
+        try:
+            result = optimize_setup(rider, bike, segments, variables,
+                                    ftp=self.var_ftp.get(), include_pacing=True)
+        except Exception as exc:
+            messagebox.showerror("Optimize failed", str(exc))
+            return
+        self._last_optimize_result = result
+        self._display_optimize_results(result)
+
+    def _display_optimize_results(self, result: Any) -> None:
+        imp = self._imperial
+        lines = [
+            f"Baseline finish:  {_format_time(result.baseline_time_s)}",
+            f"Optimized finish: {_format_time(result.optimized_time_s)}",
+            f"Time saved:       {result.time_saved_s:.0f}s "
+            f"({result.time_saved_s / 60.0:.1f} min)",
+            "",
+            "Recommended setup:",
+        ]
+        for key in result.variable_keys:
+            unit = _planner_unit(key, imp)
+            base = _planner_to_display(key, result.baseline_values[key], imp)
+            opt = _planner_to_display(key, result.optimized_values[key], imp)
+            lines.append(
+                f"  \u2022 {PLANNER_PARAMS[key]['label']}: "
+                f"{base:.3g} \u2192 {opt:.3g} {unit}")
+        if result.pacing is not None:
+            pac = result.pacing
+            lines.append("")
+            lines.append(
+                f"Pacing: avg {pac.avg_power:.0f} W, "
+                f"{_format_time(pac.total_time_s)} "
+                f"(saves {pac.time_saved_s:.0f}s vs even pace)")
+        self.lbl_optimize_results.configure(text="\n".join(lines))
+
+        t = self._theme
+        ax = self.ax_optimize
+        ax.clear()
+        _style_ax(ax, t)
+        if result.pacing is not None and result.pacing.segments:
+            segs = result.pacing.segments
+            idx = list(range(1, len(segs) + 1))
+            powers = [s.optimal_power for s in segs]
+            colors = [t["DANGER"] if s.grade_pct > 2 else
+                      (t["ACCENT3"] if s.grade_pct >= -2 else t["ACCENT2"])
+                      for s in segs]
+            ax.bar(idx, powers, color=colors, edgecolor=t["BORDER"], alpha=0.9)
+            ax.axhline(result.pacing.avg_power, color=t["FG_DIM"],
+                       linestyle="--", linewidth=1, label="Avg power")
+            ax.set_xlabel("Segment", color=t["FG"], fontsize=9)
+            ax.set_ylabel("Recommended power (W)", color=t["FG"], fontsize=9)
+            ax.set_title("Recommended Pacing (red=climb, green=descent)",
+                         color=t["FG"], fontsize=11, fontweight="bold")
+            ax.legend(facecolor=t["BG_LIGHT"], edgecolor=t["BORDER"],
+                      labelcolor=t["FG"], fontsize=8)
+        else:
+            ax.bar(["Baseline", "Optimized"],
+                   [result.baseline_time_s / 60.0,
+                    result.optimized_time_s / 60.0],
+                   color=[t["DANGER"], t["ACCENT2"]], edgecolor=t["BORDER"])
+            ax.set_ylabel("Finish time (min)", color=t["FG"], fontsize=9)
+            ax.set_title("Baseline vs Optimized", color=t["FG"],
+                         fontsize=11, fontweight="bold")
+        self.canvas_optimize.draw_idle()
+
+    def _reunit_planner(self, old_imp: bool, new_imp: bool) -> None:
+        """Convert all tracked planner entries between unit systems."""
+        for rec in self._planner_unit_entries:
+            metric = _planner_to_metric(rec["key"], rec["var"].get(),
+                                        old_imp, rec["is_delta"])
+            rec["var"].set(round(_planner_to_display(
+                rec["key"], metric, new_imp, rec["is_delta"]), 5))
+            rec["unit_label"].configure(
+                text=_planner_unit(rec["key"], new_imp))
+        # Sweep 1D min/max + unit label
+        for key, vmin, vmax, ulbl in [
+            (self._sweep1d_key, self.var_sweep1d_min, self.var_sweep1d_max,
+             self.lbl_sweep1d_unit),
+            (self._sweep2d_xkey, self.var_sweep2d_xmin, self.var_sweep2d_xmax,
+             self.lbl_sweep2d_xunit),
+            (self._sweep2d_ykey, self.var_sweep2d_ymin, self.var_sweep2d_ymax,
+             self.lbl_sweep2d_yunit),
+        ]:
+            for v in (vmin, vmax):
+                m = _planner_to_metric(key, v.get(), old_imp)
+                v.set(round(_planner_to_display(key, m, new_imp), 4))
+            ulbl.configure(text=_planner_unit(key, new_imp))
+        # Re-render cached charts
+        if self._last_mc_result is not None:
+            self._display_mc_results(self._last_mc_result)
+        if self._last_sweep1d_result is not None:
+            self._display_sweep1d_results(self._last_sweep1d_result)
+        if self._last_sweep2d_result is not None:
+            self._display_sweep2d_results(self._last_sweep2d_result)
+        if self._last_optimize_result is not None:
+            self._display_optimize_results(self._last_optimize_result)
+
+    # ==================================================================
+    # TAB 15: Export
     # ==================================================================
     def _build_export_tab(self) -> None:
         tab = ttk.Frame(self._notebook)
@@ -2543,6 +3320,7 @@ class BikeSimApp(tk.Tk):
     # Unit toggle
     # ------------------------------------------------------------------
     def _toggle_units(self) -> None:
+        old_imperial = self._imperial
         self._imperial = not self._imperial
         if self._imperial:
             self._unit_btn.configure(text="\u21c4 Metric")
@@ -2562,6 +3340,8 @@ class BikeSimApp(tk.Tk):
             self._display_whatif_results(self._last_whatif_results)
         if hasattr(self, '_last_kom_prediction') and self._last_kom_prediction:
             self._display_kom_results(self._last_kom_prediction)
+        # Race Planner: convert entries + re-render cached charts
+        self._reunit_planner(old_imperial, self._imperial)
 
     # ------------------------------------------------------------------
     # Presets

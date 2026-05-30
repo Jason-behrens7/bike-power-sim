@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import math
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import NamedTuple
@@ -509,18 +509,26 @@ def solve_speed(
     bike: BikeParams,
     course: CourseParams,
     power_override: float | None = None,
+    cda_override: float | None = None,
+    crr_override: float | None = None,
     max_iter: int = 100,
     tol: float = 1e-6,
 ) -> SimulationResult:
-    """Solve for steady-state speed given power and conditions."""
+    """Solve for steady-state speed given power and conditions.
+
+    ``cda_override`` and ``crr_override`` allow callers (e.g. parameter
+    sweeps) to pin the drag area / rolling resistance directly. When left
+    as ``None`` they are derived from the rider/bike exactly as before, so
+    the physics is unchanged for existing callers.
+    """
     pw = power_override if power_override is not None else rider.power_watts
     total_mass = rider.weight_kg + bike.weight_kg
     inertia_factor = wheel_inertia_factor(
         bike.wheel_mass_kg, bike.wheel_radius_m, total_mass
     )
     effective_mass = total_mass * inertia_factor
-    cda = calculate_cda(rider.height_cm, bike.position)
-    crr = TIRE_CRR[bike.tire_type]
+    cda = cda_override if cda_override is not None else calculate_cda(rider.height_cm, bike.position)
+    crr = crr_override if crr_override is not None else TIRE_CRR[bike.tire_type]
     rho = air_density(course.elevation_m, course.temperature_c)
     grade_rad = grade_to_radians(course.grade_pct)
     hw = effective_headwind(course.headwind_kmh, course.wind_direction_deg)
@@ -1973,4 +1981,456 @@ def predict_kom(
         segments=segment_results,
         total_rider_time_s=total_rider_time,
         total_category_times=total_cat,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Race Planner: Monte Carlo, parameter sweeps & optimization
+# ---------------------------------------------------------------------------
+
+# Canonical planner variables and their (metric) display metadata.
+# ``kind`` is "rider"/"bike"/"course"/"aero"/"roll" — used only for routing.
+PLANNER_PARAMS: dict[str, dict] = {
+    "power_watts": {"label": "Avg Power", "unit": "W", "kind": "rider"},
+    "weight_kg": {"label": "Rider Weight", "unit": "kg", "kind": "rider"},
+    "bike_weight_kg": {"label": "Bike Weight", "unit": "kg", "kind": "bike"},
+    "headwind_kmh": {"label": "Wind Speed", "unit": "km/h", "kind": "course"},
+    "wind_direction_deg": {"label": "Wind Direction", "unit": "\u00b0", "kind": "course"},
+    "temperature_c": {"label": "Temperature", "unit": "\u00b0C", "kind": "course"},
+    "cda": {"label": "Aero (CdA)", "unit": "m\u00b2", "kind": "aero"},
+    "crr": {"label": "Rolling (Crr)", "unit": "", "kind": "roll"},
+}
+
+
+def _clamp_planner_value(key: str, value: float) -> float:
+    """Keep a sampled/swept planner value physically valid."""
+    if key == "power_watts":
+        return max(1.0, value)
+    if key == "weight_kg":
+        return max(20.0, value)
+    if key == "bike_weight_kg":
+        return max(1.0, value)
+    if key == "cda":
+        return max(0.05, value)
+    if key == "crr":
+        return max(0.0005, value)
+    if key == "temperature_c":
+        return max(-30.0, min(60.0, value))
+    if key == "wind_direction_deg":
+        return value % 360.0
+    return value
+
+
+def planner_base_value(
+    rider: RiderParams,
+    bike: BikeParams,
+    segments: list[CourseSegment],
+    key: str,
+) -> float:
+    """Return the current value of a planner variable for the given setup.
+
+    Course-level variables (wind, temperature) are averaged across segments.
+    """
+    if key == "power_watts":
+        return rider.power_watts
+    if key == "weight_kg":
+        return rider.weight_kg
+    if key == "bike_weight_kg":
+        return bike.weight_kg
+    if key == "cda":
+        return calculate_cda(rider.height_cm, bike.position)
+    if key == "crr":
+        return TIRE_CRR[bike.tire_type]
+    if not segments:
+        return 0.0
+    if key == "headwind_kmh":
+        return sum(s.headwind_kmh for s in segments) / len(segments)
+    if key == "wind_direction_deg":
+        return sum(s.wind_direction_deg for s in segments) / len(segments)
+    if key == "temperature_c":
+        return sum(s.temperature_c for s in segments) / len(segments)
+    return 0.0
+
+
+def _planner_evaluate(
+    rider: RiderParams,
+    bike: BikeParams,
+    segments: list[CourseSegment],
+    overrides: dict[str, float],
+) -> tuple[float, float]:
+    """Evaluate total time (s) and avg speed (km/h) with parameter overrides.
+
+    ``overrides`` maps planner keys to absolute values. Missing keys keep
+    each segment's own value (for course variables) or the base rider/bike
+    value. Rider/bike are copied so the caller's objects are untouched.
+    """
+    test_rider = replace(rider)
+    test_bike = replace(bike)
+    if "power_watts" in overrides:
+        test_rider.power_watts = overrides["power_watts"]
+    if "weight_kg" in overrides:
+        test_rider.weight_kg = overrides["weight_kg"]
+    if "bike_weight_kg" in overrides:
+        test_bike.weight_kg = overrides["bike_weight_kg"]
+
+    cda_override = overrides.get("cda")
+    crr_override = overrides.get("crr")
+
+    total_time = 0.0
+    total_dist = 0.0
+    for seg in segments:
+        course = CourseParams(
+            grade_pct=seg.grade_pct,
+            headwind_kmh=overrides.get("headwind_kmh", seg.headwind_kmh),
+            wind_direction_deg=overrides.get("wind_direction_deg", seg.wind_direction_deg),
+            elevation_m=seg.elevation_m,
+            temperature_c=overrides.get("temperature_c", seg.temperature_c),
+        )
+        res = solve_speed(
+            test_rider, test_bike, course,
+            cda_override=cda_override, crr_override=crr_override,
+        )
+        total_time += seg.distance_m / max(res.speed_ms, 0.1)
+        total_dist += seg.distance_m
+
+    avg_speed = (total_dist / total_time * 3.6) if total_time > 0 else 0.0
+    return total_time, avg_speed
+
+
+# ---- Monte Carlo -----------------------------------------------------------
+
+@dataclass
+class MCVariable:
+    """A single uncertain input for a Monte Carlo race simulation."""
+    key: str
+    distribution: str = "normal"  # "normal" | "uniform"
+    mean: float = 0.0
+    std: float = 0.0
+    low: float = 0.0
+    high: float = 0.0
+
+
+@dataclass
+class MonteCarloResult:
+    """Distribution of finish times from a Monte Carlo simulation."""
+    n: int
+    distance_m: float
+    times_s: list[float]
+    avg_speeds_kmh: list[float]
+    mean_time_s: float
+    std_time_s: float
+    percentiles_s: dict[int, float]
+    min_time_s: float
+    max_time_s: float
+    variable_keys: list[str]
+
+
+def monte_carlo_simulation(
+    rider: RiderParams,
+    bike: BikeParams,
+    segments: list[CourseSegment],
+    variables: list[MCVariable],
+    n: int = 1000,
+    seed: int | None = None,
+) -> MonteCarloResult:
+    """Run ``n`` random course simulations, sampling the given variables.
+
+    Returns the full distribution of finish times plus summary statistics
+    (mean/std and P5/P10/P25/P50/P75/P90/P95 percentiles).
+    """
+    if not segments:
+        raise ValueError("Monte Carlo requires at least one course segment.")
+    if n < 1:
+        raise ValueError("n must be >= 1.")
+
+    rng = np.random.default_rng(seed)
+    times: list[float] = []
+    speeds: list[float] = []
+    distance = sum(s.distance_m for s in segments)
+
+    for _ in range(n):
+        overrides: dict[str, float] = {}
+        for v in variables:
+            if v.distribution == "uniform":
+                val = rng.uniform(v.low, v.high)
+            else:
+                val = rng.normal(v.mean, v.std)
+            overrides[v.key] = _clamp_planner_value(v.key, float(val))
+        t, s = _planner_evaluate(rider, bike, segments, overrides)
+        times.append(t)
+        speeds.append(s)
+
+    arr = np.array(times)
+    pct_levels = [5, 10, 25, 50, 75, 90, 95]
+    percentiles = {p: float(np.percentile(arr, p)) for p in pct_levels}
+
+    return MonteCarloResult(
+        n=n,
+        distance_m=distance,
+        times_s=times,
+        avg_speeds_kmh=speeds,
+        mean_time_s=float(arr.mean()),
+        std_time_s=float(arr.std()),
+        percentiles_s=percentiles,
+        min_time_s=float(arr.min()),
+        max_time_s=float(arr.max()),
+        variable_keys=[v.key for v in variables],
+    )
+
+
+# ---- 1D parameter sweep ----------------------------------------------------
+
+@dataclass
+class Sweep1DResult:
+    """Finish-time response to sweeping a single input."""
+    key: str
+    values: list[float]
+    times_s: list[float]
+    avg_speeds_kmh: list[float]
+    distance_m: float
+    base_value: float
+    base_time_s: float
+
+
+def sweep_1d(
+    rider: RiderParams,
+    bike: BikeParams,
+    segments: list[CourseSegment],
+    key: str,
+    min_value: float,
+    max_value: float,
+    num_points: int = 25,
+) -> Sweep1DResult:
+    """Sweep one variable across [min, max] and record finish time/speed."""
+    if not segments:
+        raise ValueError("Sweep requires at least one course segment.")
+    if key not in PLANNER_PARAMS:
+        raise ValueError(f"Unknown planner variable: {key}")
+    num_points = max(2, num_points)
+
+    values = list(np.linspace(min_value, max_value, num_points))
+    times: list[float] = []
+    speeds: list[float] = []
+    for val in values:
+        v = _clamp_planner_value(key, float(val))
+        t, s = _planner_evaluate(rider, bike, segments, {key: v})
+        times.append(t)
+        speeds.append(s)
+
+    base_value = planner_base_value(rider, bike, segments, key)
+    base_time, _ = _planner_evaluate(rider, bike, segments, {})
+
+    return Sweep1DResult(
+        key=key,
+        values=values,
+        times_s=times,
+        avg_speeds_kmh=speeds,
+        distance_m=sum(s.distance_m for s in segments),
+        base_value=base_value,
+        base_time_s=base_time,
+    )
+
+
+# ---- 2D parameter sweep (contour) ------------------------------------------
+
+@dataclass
+class Sweep2DResult:
+    """Finish-time grid over two swept inputs (for a contour/heatmap)."""
+    key_x: str
+    key_y: str
+    x_values: list[float]
+    y_values: list[float]
+    times_s: list[list[float]]  # times_s[iy][ix]
+    distance_m: float
+    best_x: float
+    best_y: float
+    best_time_s: float
+    base_x: float
+    base_y: float
+
+
+def sweep_2d(
+    rider: RiderParams,
+    bike: BikeParams,
+    segments: list[CourseSegment],
+    key_x: str,
+    key_y: str,
+    x_range: tuple[float, float],
+    y_range: tuple[float, float],
+    num_x: int = 25,
+    num_y: int = 25,
+) -> Sweep2DResult:
+    """Sweep two variables on a grid; return a time matrix + optimum cell."""
+    if not segments:
+        raise ValueError("Sweep requires at least one course segment.")
+    if key_x not in PLANNER_PARAMS or key_y not in PLANNER_PARAMS:
+        raise ValueError("Unknown planner variable.")
+    if key_x == key_y:
+        raise ValueError("Choose two different variables for a 2D sweep.")
+    num_x = max(2, num_x)
+    num_y = max(2, num_y)
+
+    x_values = list(np.linspace(x_range[0], x_range[1], num_x))
+    y_values = list(np.linspace(y_range[0], y_range[1], num_y))
+
+    grid: list[list[float]] = []
+    best_time = float("inf")
+    best_x = x_values[0]
+    best_y = y_values[0]
+
+    for yv in y_values:
+        row: list[float] = []
+        yc = _clamp_planner_value(key_y, float(yv))
+        for xv in x_values:
+            xc = _clamp_planner_value(key_x, float(xv))
+            t, _ = _planner_evaluate(
+                rider, bike, segments, {key_x: xc, key_y: yc}
+            )
+            row.append(t)
+            if t < best_time:
+                best_time = t
+                best_x = float(xv)
+                best_y = float(yv)
+        grid.append(row)
+
+    return Sweep2DResult(
+        key_x=key_x,
+        key_y=key_y,
+        x_values=x_values,
+        y_values=y_values,
+        times_s=grid,
+        distance_m=sum(s.distance_m for s in segments),
+        best_x=best_x,
+        best_y=best_y,
+        best_time_s=best_time,
+        base_x=planner_base_value(rider, bike, segments, key_x),
+        base_y=planner_base_value(rider, bike, segments, key_y),
+    )
+
+
+# ---- Optimization ----------------------------------------------------------
+
+@dataclass
+class OptimizeVariable:
+    """A variable to optimize, with inclusive bounds."""
+    key: str
+    low: float
+    high: float
+
+
+@dataclass
+class OptimizationResult:
+    """Best achievable setup found within the given bounds."""
+    baseline_time_s: float
+    optimized_time_s: float
+    time_saved_s: float
+    baseline_values: dict[str, float]
+    optimized_values: dict[str, float]
+    distance_m: float
+    variable_keys: list[str]
+    pacing: "PacingResult | None" = None
+
+
+def _golden_section_min(f, a: float, b: float, tol: float = 1e-3,
+                        max_iter: int = 80) -> float:
+    """Return x in [a, b] minimizing the unimodal function f."""
+    if a > b:
+        a, b = b, a
+    gr = (math.sqrt(5.0) - 1.0) / 2.0
+    c = b - gr * (b - a)
+    d = a + gr * (b - a)
+    fc = f(c)
+    fd = f(d)
+    for _ in range(max_iter):
+        if abs(b - a) < tol:
+            break
+        if fc < fd:
+            b, d, fd = d, c, fc
+            c = b - gr * (b - a)
+            fc = f(c)
+        else:
+            a, c, fc = c, d, fd
+            d = a + gr * (b - a)
+            fd = f(d)
+    return (a + b) / 2.0
+
+
+def optimize_setup(
+    rider: RiderParams,
+    bike: BikeParams,
+    segments: list[CourseSegment],
+    variables: list[OptimizeVariable],
+    ftp: float | None = None,
+    include_pacing: bool = True,
+    passes: int = 3,
+) -> OptimizationResult:
+    """Minimize finish time over the chosen variables within their bounds.
+
+    Uses coordinate descent with golden-section search on each variable.
+    Optionally returns a recommended pacing plan for the optimized power.
+    """
+    if not segments:
+        raise ValueError("Optimization requires at least one course segment.")
+
+    baseline_time, _ = _planner_evaluate(rider, bike, segments, {})
+    baseline_values = {
+        v.key: planner_base_value(rider, bike, segments, v.key) for v in variables
+    }
+
+    # Start each variable at its base value clamped into the allowed bounds.
+    current: dict[str, float] = {}
+    for v in variables:
+        base = baseline_values[v.key]
+        lo, hi = min(v.low, v.high), max(v.low, v.high)
+        current[v.key] = _clamp_planner_value(v.key, min(max(base, lo), hi))
+
+    def eval_time(overrides: dict[str, float]) -> float:
+        t, _ = _planner_evaluate(rider, bike, segments, overrides)
+        return t
+
+    for _ in range(max(1, passes)):
+        for v in variables:
+            lo, hi = min(v.low, v.high), max(v.low, v.high)
+
+            def f(x: float, key: str = v.key) -> float:
+                trial = dict(current)
+                trial[key] = _clamp_planner_value(key, x)
+                return eval_time(trial)
+
+            best_x = _golden_section_min(f, lo, hi)
+            # Compare against the bounds too (optimum is often at an edge).
+            candidates = [best_x, lo, hi]
+            best = min(candidates, key=lambda x, kk=v.key: f(x, kk))
+            current[v.key] = _clamp_planner_value(v.key, best)
+
+    optimized_time = eval_time(current)
+
+    pacing = None
+    if include_pacing:
+        opt_rider = replace(rider)
+        opt_bike = replace(bike)
+        if "power_watts" in current:
+            opt_rider.power_watts = current["power_watts"]
+        if "weight_kg" in current:
+            opt_rider.weight_kg = current["weight_kg"]
+        if "bike_weight_kg" in current:
+            opt_bike.weight_kg = current["bike_weight_kg"]
+        pacing_ftp = ftp if ftp is not None else opt_rider.power_watts
+        try:
+            pacing = optimize_pacing(
+                opt_rider, opt_bike, segments, ftp=pacing_ftp,
+                target_avg_power=opt_rider.power_watts,
+            )
+        except Exception:
+            pacing = None
+
+    return OptimizationResult(
+        baseline_time_s=baseline_time,
+        optimized_time_s=optimized_time,
+        time_saved_s=baseline_time - optimized_time,
+        baseline_values=baseline_values,
+        optimized_values=current,
+        distance_m=sum(s.distance_m for s in segments),
+        variable_keys=[v.key for v in variables],
+        pacing=pacing,
     )

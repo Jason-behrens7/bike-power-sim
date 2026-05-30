@@ -19,13 +19,13 @@ A physics-based cycling power simulation with a graphical user interface. Calcul
 - **Interactive Tabbed GUI** (10 tabs):
   - **Simulation**: Real-time speed calculation with sliders, power zone display, calorie estimates, W/kg display
   - **Course Profile**: Multi-segment routes with GPX import, speed/elevation charts, animated ride playback
-  - **Workout**: Interval/workout simulator with zone-colored power profiles
-  - **Compare**: Side-by-side scenario comparison with bar charts
-  - **W/kg Analysis**: Power-to-weight ratio with rider classification (Cat 5 to World Tour Pro)
-  - **Race**: Virtual race simulation with multiple competitors and gap analysis
   - **3D / Map**: 3D course visualization, elevation heatmap overlay, and gradient-colored route map from GPX
-  - **CP / W'**: Critical power model with power-duration curves and time-to-exhaustion analysis
   - **Pacing**: Route optimization with optimal power distribution strategy
+  - **Live Ride**: Real-time animated ride playback with adjustable power and live W' balance
+  - **Ride Analysis**: Import a past GPX ride and overlay predicted vs actual speed
+  - **What-If**: Instantly see the time impact of changing weight, power, position, or tires
+  - **KOM Predictor**: Predict segment times vs category benchmarks
+  - **Race Planner**: Monte Carlo finish-time distributions, 1D/2D parameter sweeps, and setup optimization
   - **Export**: CSV and PDF report generation
 
 - **Dark/Light Theme Toggle**: Switch between Catppuccin dark and light color schemes
@@ -59,6 +59,12 @@ A physics-based cycling power simulation with a graphical user interface. Calcul
 - **Critical Power Model (CP & W')**: Estimate or fit the 2-parameter critical power model, view power-duration curves, time-to-exhaustion analysis, and W' balance
 
 - **Route Optimization / Pacing Strategy**: Optimal power distribution across course segments — push harder on climbs, ease on descents, with time savings vs even-pace comparison
+
+- **Race Planner**: Turn the simulator into a race-prep tool —
+  - **Monte Carlo**: sample uncertain inputs (power, weight, wind, temperature, CdA, Crr) and get a finish-time distribution with P5/P50/P90/P95 percentiles
+  - **1D parameter sweep**: see how finish time and average speed respond to one input across a range, with diminishing returns visible
+  - **2D contour**: sweep two inputs and render a finish-time contour/heatmap with the optimum and your current setup marked
+  - **Optimization**: find the fastest setup within your bounds and a recommended pacing plan
 
 - **Input Validation**: Real-time feedback for out-of-range parameter values
 
