@@ -2329,6 +2329,9 @@ class OptimizationResult:
     distance_m: float
     variable_keys: list[str]
     pacing: "PacingResult | None" = None
+    # Finish time of the recommended pacing plan, evaluated with the
+    # *optimized* setup (so it is directly comparable to optimized_time_s).
+    pacing_time_s: float | None = None
 
 
 def _golden_section_min(f, a: float, b: float, tol: float = 1e-3,
@@ -2415,7 +2418,11 @@ def optimize_setup(
             opt_rider.weight_kg = current["weight_kg"]
         if "bike_weight_kg" in current:
             opt_bike.weight_kg = current["bike_weight_kg"]
-        pacing_ftp = ftp if ftp is not None else opt_rider.power_watts
+        base_ftp = ftp if ftp is not None else opt_rider.power_watts
+        # Ensure the pacing power cap (ftp*1.2) leaves headroom above the
+        # optimized average power, otherwise every segment saturates and the
+        # plan comes out flat.
+        pacing_ftp = max(base_ftp, opt_rider.power_watts)
         try:
             pacing = optimize_pacing(
                 opt_rider, opt_bike, segments, ftp=pacing_ftp,
@@ -2423,6 +2430,30 @@ def optimize_setup(
             )
         except Exception:
             pacing = None
+
+    # Re-evaluate the pacing plan's finish time with the full optimized setup
+    # (including CdA/Crr/course overrides) so it is comparable to the
+    # constant-power optimized time. optimize_pacing's own time ignores those.
+    pacing_time = None
+    if pacing is not None and pacing.segments:
+        cda_over = current.get("cda")
+        crr_over = current.get("crr")
+        pacing_time = 0.0
+        for seg, ps in zip(segments, pacing.segments):
+            course = CourseParams(
+                grade_pct=seg.grade_pct,
+                headwind_kmh=current.get("headwind_kmh", seg.headwind_kmh),
+                wind_direction_deg=current.get("wind_direction_deg",
+                                               seg.wind_direction_deg),
+                elevation_m=seg.elevation_m,
+                temperature_c=current.get("temperature_c", seg.temperature_c),
+            )
+            res = solve_speed(
+                opt_rider, opt_bike, course,
+                power_override=ps.optimal_power,
+                cda_override=cda_over, crr_override=crr_over,
+            )
+            pacing_time += seg.distance_m / max(res.speed_ms, 0.1)
 
     return OptimizationResult(
         baseline_time_s=baseline_time,
@@ -2433,4 +2464,5 @@ def optimize_setup(
         distance_m=sum(s.distance_m for s in segments),
         variable_keys=[v.key for v in variables],
         pacing=pacing,
+        pacing_time_s=pacing_time,
     )

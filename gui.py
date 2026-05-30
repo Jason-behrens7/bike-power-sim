@@ -3032,13 +3032,13 @@ class BikeSimApp(tk.Tk):
             lines.append(
                 f"  \u2022 {PLANNER_PARAMS[key]['label']}: "
                 f"{base:.3g} \u2192 {opt:.3g} {unit}")
-        if result.pacing is not None:
+        if result.pacing is not None and result.pacing.segments:
             pac = result.pacing
             lines.append("")
             lines.append(
-                f"Pacing: avg {pac.avg_power:.0f} W, "
-                f"{_format_time(pac.total_time_s)} "
-                f"(saves {pac.time_saved_s:.0f}s vs even pace)")
+                f"Recommended pacing (avg {pac.avg_power:.0f} W):")
+            lines.append(
+                "  push harder on climbs, ease on descents \u2014 see chart.")
         self.lbl_optimize_results.configure(text="\n".join(lines))
 
         t = self._theme
